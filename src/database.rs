@@ -1,5 +1,7 @@
 use once_cell::unsync::OnceCell;
 use std::marker::PhantomData;
+use reqwest;
+use soup;
 
 use semanticscholar;
 
@@ -101,14 +103,23 @@ impl<'a> PublicationBuilder<'a, Finalizable> {
 }
 
 macro_rules! smart_getter {
+	( $what:ident: Option<$type:ty>, [ $( $retriever:ident ),+ ] ) => {
+		#[allow(unused)]
+		pub fn $what(&self) -> &Option<$type> {
+			$(
+				if self.$what.get().is_none() { self.$retriever(); }
+			)+
+			if self.$what.get().is_none() { println!("not found :("); self.$what.set(None); }
+			return self.$what.get().unwrap();
+		}
+	};
 	( $what:ident: $type:ty, [ $( $retriever:ident ),+ ] ) => {
 		#[allow(unused)]
 		pub fn $what(&self) -> &$type {
-			let mut val = self.$what.get();
 			$(
-				if val.is_none() { self.$retriever(); val = self.$what.get(); }
+				if self.$what.get().is_none() { self.$retriever(); }
 			)+
-			return val.unwrap();
+			return self.$what.get().unwrap();
 		}
 	}
 }
@@ -141,6 +152,49 @@ impl<'a> Publication<'a> {
 		}
 	}
 
+	/// scrapes the PDF link from the semanticscholar website, since this is not available through the api yet
+	pub fn scrape_pdf_from_semanticscholar(&self) -> Option<String> {
+		use soup::QueryBuilderExt;
+		use soup::NodeExt;
+
+		let query =
+			if let Some(Some(semanticscholar)) = self.semanticscholar.get() { semanticscholar.to_string() }
+			else if let Some(Some(doi)) = self.doi.get() { doi.to_string() }
+			else if let Some(Some(arxiv)) = self.arxiv.get() { "arXiv:".to_string() + arxiv }
+			else { return None; };
+
+		let url = format!("https://api.semanticscholar.org/{}", query);
+		println!("semanticscholar pdf: querying {}", url);
+		match reqwest::blocking::get(&url) {
+			Ok(response) => {
+				println!("\tsuccess!");
+				match response.text() {
+					Ok(text) => {
+						println!("\tparsing html!");
+						let doc = soup::Soup::new(&text);
+						for link in doc.tag("a").attr("data-heap-unpaywall-link","true").find_all() {
+							//println!("\t\tlink: {}", link.display());
+							match link.get("link") {
+								Some(result) => { println!("\t\t=> {}", result); return Some(result) },
+								None => ()
+							}
+						}
+						None
+					}
+					Err(_) => None
+				}
+			}
+			Err(_) => None
+		}
+	}
+
+	pub fn retrieve_pdf_from_semanticscholar(&self) {
+		if let Some(url) = self.scrape_pdf_from_semanticscholar() {
+			self.pdf.set(Some(url));
+		}
+	}
+
+	/// queries the semanticscholar API. this gives some metadata, cited-by and references, but not pdf.
 	pub fn retrieve_from_semanticscholar(&self) {
 		println!("**** RETRIEVING FROM SEMANTICSCHOLAR ****");
 		let client = semanticscholar::Client::new();
@@ -181,18 +235,8 @@ impl<'a> Publication<'a> {
 	}
 
 	
-	/*pub fn cited_by(&self) -> &Vec<Publication<'a>> {
-		let mut val = self.cited_by.get();
-		if val.is_none() { self.retrieve_from_semanticscholar(); val = self.cited_by.get(); }
-		val.unwrap()
-	}*/
-
-	/*pub fn references(&self) -> &Vec<Publication<'a>> {
-		let mut val = self.cited_by.get();
-		if val.is_none() { self.retrieve_from_semanticscholar(); }
-		val.unwrap()
-	}*/
 	smart_getter!(cited_by: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
 	smart_getter!(references: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
+	smart_getter!(pdf: Option<String>, [retrieve_pdf_from_semanticscholar]);
 }
 
