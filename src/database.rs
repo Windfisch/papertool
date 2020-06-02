@@ -2,6 +2,7 @@ use once_cell::unsync::OnceCell;
 use std::marker::PhantomData;
 use reqwest;
 use soup;
+use std::fmt::{Debug,Display};
 
 use semanticscholar;
 
@@ -124,6 +125,35 @@ macro_rules! smart_getter {
 	}
 }
 
+#[derive(Debug)]
+struct HTTPError(reqwest::StatusCode);
+impl Display for HTTPError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "HTTP Error {} ({})", self.0.as_str(), self.0.canonical_reason().unwrap_or("?")) // user-facing output
+	}
+}
+impl std::error::Error for HTTPError {}
+
+#[derive(Debug)]
+struct ParseError(String);
+impl Display for ParseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "Parse Error: {}", self.0)
+	}
+}
+impl ParseError {
+	fn new(reason: &str) -> ParseError { ParseError(reason.to_string()) }
+}
+impl std::error::Error for ParseError {}
+
+#[derive(Debug)]
+pub enum RetrieveError {
+	InsufficientData,
+	NoResult,
+	RequestError(Box<dyn std::error::Error>),
+	MalformedReply(Box<dyn std::error::Error>)
+}
+
 impl<'a> Publication<'a> {
 	/// Allows to create a new Publication object through a [PublicationBuilder].
 	/// Example:
@@ -153,7 +183,7 @@ impl<'a> Publication<'a> {
 	}
 
 	/// scrapes the PDF link from the semanticscholar website, since this is not available through the api yet
-	pub fn scrape_pdf_from_semanticscholar(&self) -> Option<String> {
+	pub fn scrape_pdf_from_semanticscholar(&self) -> Result<String, RetrieveError> {
 		use soup::QueryBuilderExt;
 		use soup::NodeExt;
 
@@ -161,12 +191,24 @@ impl<'a> Publication<'a> {
 			if let Some(Some(semanticscholar)) = self.semanticscholar.get() { semanticscholar.to_string() }
 			else if let Some(Some(doi)) = self.doi.get() { doi.to_string() }
 			else if let Some(Some(arxiv)) = self.arxiv.get() { "arXiv:".to_string() + arxiv }
-			else { return None; };
+			else { return Err(RetrieveError::InsufficientData); };
 
 		let url = format!("https://api.semanticscholar.org/{}", query);
 		println!("semanticscholar pdf: querying {}", url);
 		match reqwest::blocking::get(&url) {
 			Ok(response) => {
+				
+				let status = response.status();
+				if !status.is_success() {
+					if status == 404 {
+						println!("semanticscholar returned 404");
+						return Err(RetrieveError::NoResult);
+					}
+					else {
+						return Err(RetrieveError::RequestError(Box::new(HTTPError(status))));
+					}
+				}
+
 				println!("\tsuccess!");
 				match response.text() {
 					Ok(text) => {
@@ -175,21 +217,21 @@ impl<'a> Publication<'a> {
 						for link in doc.tag("a").attr("data-heap-unpaywall-link","true").find_all() {
 							//println!("\t\tlink: {}", link.display());
 							match link.get("link") {
-								Some(result) => { println!("\t\t=> {}", result); return Some(result) },
+								Some(result) => { println!("\t\t=> {}", result); return Ok(result) },
 								None => ()
 							}
 						}
-						None
+						Err(RetrieveError::NoResult)
 					}
-					Err(_) => None
+					Err(e) => Err(RetrieveError::RequestError(Box::new(e)))
 				}
 			}
-			Err(_) => None
+			Err(e) => Err(RetrieveError::RequestError(Box::new(e)))
 		}
 	}
 
 	pub fn retrieve_pdf_from_semanticscholar(&self) {
-		if let Some(url) = self.scrape_pdf_from_semanticscholar() {
+		if let Ok(url) = self.scrape_pdf_from_semanticscholar() {
 			self.pdf.set(Some(url));
 		}
 	}
