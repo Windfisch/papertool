@@ -4,16 +4,89 @@ use reqwest;
 use soup;
 use std::fmt::{Debug,Display};
 
+use rusqlite;
+
 use semanticscholar;
 
 /// PublicationCache provides an interface to the local database that caches
 /// all external API lookups.
 pub struct PublicationCache {
-	
+	database: rusqlite::Connection
+}
+
+macro_rules! dbfoo {
+	( $refs:ident, $query:ident, $publ:ident, [ $( $var:ident ),+ ] ) => {
+		let $refs = rusqlite::params![
+			$(
+				$publ.$var.get().unwrap_or(&None) as &dyn rusqlite::ToSql,
+				$publ.$var.get().is_some()
+			),+,
+			$publ.database_id.get().unwrap()
+		];
+
+		let $query =
+			"UPDATE cache SET ".to_string() +
+			&{
+				let mut query_strings = Vec::<String>::new();
+				$(
+					query_strings.push( stringify!($var).to_string() + " = ?");
+					query_strings.push( stringify!($var).to_string() + "_cached = ?" );
+				)+
+				query_strings
+			}.join(", ") +
+			" WHERE id = ?";
+	}
 }
 
 impl PublicationCache {
-	pub fn new() -> PublicationCache { PublicationCache{} }
+	pub fn create() -> Result<PublicationCache, rusqlite::Error> {
+		let dbfile = "/tmp/bla.sqlite";
+		let database =
+			rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+			.or_else(|e: rusqlite::Error| -> rusqlite::Result<rusqlite::Connection>{
+				let db = rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+				db.execute("CREATE TABLE cache(\
+					id INTEGER PRIMARY KEY AUTOINCREMENT,\
+					doi TEXT UNIQUE,\
+					doi_cached INTEGER,\
+					arxiv TEXT UNIQUE,\
+					arxiv_cached INTEGER,\
+					semanticscholar TEXT UNIQUE,\
+					semanticscholar_cached INTEGER,\
+					pdf TEXT,\
+					pdf_cached INTEGER);",
+					rusqlite::params![])?;
+				Ok(db)
+			})?;
+		Ok(PublicationCache {
+			database
+		})
+	}
+
+	// Note: this sucks. It if you haven't called get() on this publication before, you might
+	// overwrite your cache entry :/
+
+	pub fn write(&self, publ: &Publication) {
+		println!("Writing {:?} to the database", publ);
+		
+		if publ.database_id.get().is_none() {
+			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![]);
+			let rowid = self.database.last_insert_rowid();
+			println!("insert -> {}", rowid);
+			publ.database_id.set(rowid);
+		}
+
+		if let Some(id) = publ.database_id.get() {
+			dbfoo!(refs, query, publ, [doi, arxiv, semanticscholar, pdf]);
+			self.database.execute(&query, refs).unwrap();
+		}
+	}
+
+	pub fn get(&self, publ: &Publication) {
+		println!("Trying to get {:?} from the database", publ);
+
+		println!("Got {:?}", publ);
+	}
 }
 
 /// The most commonly used, incomplete set of metadata about a publication that
@@ -40,6 +113,7 @@ pub struct Metadata {
 pub struct Publication<'a> {
 	cache: &'a PublicationCache,
 
+	database_id: OnceCell<i64>,
 	stubmetadata: OnceCell<StubMetadata>,
 	metadata: OnceCell<Option<Metadata>>,
 	doi: OnceCell<Option<String>>,
@@ -49,6 +123,16 @@ pub struct Publication<'a> {
 
 	cited_by: OnceCell<Vec<Publication<'a>>>,
 	references: OnceCell<Vec<Publication<'a>>>,
+}
+
+impl<'a> Publication<'a> {
+	pub fn flush_cache(&self) {
+		self.cache.write(self);
+	}
+
+	pub fn try_get_cached(&self) {
+		self.cache.get(self);
+	}
 }
 
 impl<'a> std::fmt::Debug for Publication<'a> {
@@ -100,26 +184,32 @@ impl<'a, IsFinalizable : FinalizableMarker> PublicationBuilder<'a, IsFinalizable
 impl<'a> PublicationBuilder<'a, Finalizable> {
 	/// Consumes the builder and returns the actual publication. Only available if one
 	/// publication identifier has been set already.
-	pub fn fin(self) -> Publication<'a> { self.publication }
+	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication }
 }
 
 macro_rules! smart_getter {
 	( $what:ident: Option<$type:ty>, [ $( $retriever:ident ),+ ] ) => {
 		#[allow(unused)]
 		pub fn $what(&self) -> &Option<$type> {
-			$(
-				if self.$what.get().is_none() { self.$retriever(); }
-			)+
-			if self.$what.get().is_none() { println!("not found :("); self.$what.set(None); }
+			if self.$what.get().is_none() {
+				$(
+					if self.$what.get().is_none() { self.$retriever(); }
+				)+
+				if self.$what.get().is_none() { println!("not found :("); self.$what.set(None); }
+				self.flush_cache();
+			}
 			return self.$what.get().unwrap();
 		}
 	};
 	( $what:ident: $type:ty, [ $( $retriever:ident ),+ ] ) => {
 		#[allow(unused)]
 		pub fn $what(&self) -> &$type {
-			$(
-				if self.$what.get().is_none() { self.$retriever(); }
-			)+
+			if self.$what.get().is_none() {
+				$(
+					if self.$what.get().is_none() { self.$retriever(); }
+				)+
+				self.flush_cache();
+			}
 			return self.$what.get().unwrap();
 		}
 	}
@@ -171,6 +261,7 @@ impl<'a> Publication<'a> {
 	fn new(cache: &'a PublicationCache) -> Publication<'a> {
 		Publication {
 			cache,
+			database_id: OnceCell::new(),
 			stubmetadata: OnceCell::new(),
 			metadata: OnceCell::new(),
 			doi: OnceCell::new(),

@@ -2,7 +2,7 @@ mod database;
 use database::*;
 
 fn main() {
-	let cache = PublicationCache::new();
+	let cache = PublicationCache::create().unwrap();
 	//let mypub = Publication::build(&cache).doi("10.1109/ICoCS.2015.7483250").fin();
 	let mypub = Publication::build(&cache).doi("10.1001/jama.2020.2648").fin();
 	mypub.retrieve_pdf_from_semanticscholar();
