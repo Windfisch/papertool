@@ -14,36 +14,12 @@ pub struct PublicationCache {
 	database: rusqlite::Connection
 }
 
-macro_rules! dbfoo {
-	( $refs:ident, $query:ident, $publ:ident, [ $( $var:ident ),+ ] ) => {
-		let $refs = rusqlite::params![
-			$(
-				$publ.$var.get().unwrap_or(&None) as &dyn rusqlite::ToSql,
-				$publ.$var.get().is_some()
-			),+,
-			$publ.database_id.get().unwrap()
-		];
-
-		let $query =
-			"UPDATE cache SET ".to_string() +
-			&{
-				let mut query_strings = Vec::<String>::new();
-				$(
-					query_strings.push( stringify!($var).to_string() + " = ?");
-					query_strings.push( stringify!($var).to_string() + "_cached = ?" );
-				)+
-				query_strings
-			}.join(", ") +
-			" WHERE id = ?";
-	}
-}
-
 impl PublicationCache {
 	pub fn create() -> Result<PublicationCache, rusqlite::Error> {
 		let dbfile = "/tmp/bla.sqlite";
 		let database =
 			rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-			.or_else(|e: rusqlite::Error| -> rusqlite::Result<rusqlite::Connection>{
+			.or_else(|_: rusqlite::Error| -> rusqlite::Result<rusqlite::Connection>{
 				let db = rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 				db.execute("CREATE TABLE cache(\
 					id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -53,6 +29,10 @@ impl PublicationCache {
 					arxiv_cached INTEGER,\
 					semanticscholar TEXT UNIQUE,\
 					semanticscholar_cached INTEGER,\
+					metadata_title TEXT,\
+					metadata_year INTEGER,\
+					metadata_cached INTEGER,\
+					stub_title TEXT,\
 					pdf TEXT,\
 					pdf_cached INTEGER);",
 					rusqlite::params![])?;
@@ -70,20 +50,104 @@ impl PublicationCache {
 		println!("Writing {:?} to the database", publ);
 		
 		if publ.database_id.get().is_none() {
-			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![]);
+			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![]).unwrap();
 			let rowid = self.database.last_insert_rowid();
 			println!("insert -> {}", rowid);
-			publ.database_id.set(rowid);
+			publ.database_id.set(rowid).unwrap();
 		}
 
-		if let Some(id) = publ.database_id.get() {
-			dbfoo!(refs, query, publ, [doi, arxiv, semanticscholar, pdf]);
-			self.database.execute(&query, refs).unwrap();
+		let database_id = publ.database_id.get().unwrap();
+		macro_rules! cache_update {
+			([ $( $var:ident ),+ ], [ $( $metafield:ident ),+ ] ) => {
+				{
+					let refs = rusqlite::params![
+						$(
+							publ.$var.get().unwrap_or(&None),
+							publ.$var.get().is_some()
+						),+,
+						$(
+							publ.metadata.get().unwrap_or(&None).as_ref().map(|m| &m.$metafield)
+						),+,
+						publ.metadata.get().is_some(),
+						publ.stubmetadata.get().map(|m| &m.title),
+						database_id
+					];
+
+					let query =
+						"UPDATE cache SET ".to_string() +
+						$(
+							stringify!($var) + " = ?, " +
+							stringify!($var) + "_cached = ?, " +
+						)+
+						$(
+							"metadata_" + stringify!($metafield) + " = ?, " +
+						)+
+						"metadata_cached = ?, " +
+						"stub_title = ?" +
+						" WHERE id = ?";
+
+					println!("cache.write -> {}", query);
+
+					self.database.execute(&query, refs)
+				}
+			}
 		}
+		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] ).unwrap();
 	}
 
 	pub fn get(&self, publ: &Publication) {
 		println!("Trying to get {:?} from the database", publ);
+
+		macro_rules! find_by {
+			([ $( $idfield:ident ),+ ], [ $( $field:ident ),+ ] ) =>
+			{
+				let mut query = "SELECT id".to_string() +
+				$(
+					", " + stringify!($field) +
+					", " + stringify!($field) + "_cached" +
+				)+
+				" FROM cache WHERE 0 = 1"; // this is extended by several ORs
+				let mut params = Vec::<&str>::new();
+
+
+				$(
+					if let Some(Some(val)) = publ.$idfield.get() {
+						query = query + " OR " + stringify!($idfield) + " = ?";
+						params.push(val);
+					}
+				)+
+				
+				println!("cache.get -> {}", query);
+
+				let result = self.database.query_row(
+					&query,
+					params,
+					|r| { // this function is executed when there is exactly one matching row
+						let mut i = 0;
+						publ.database_id.set(r.get(i)?);
+						i+=1;
+						$(
+							let is_cached: bool = r.get(i+1)?;
+
+							if is_cached {
+								let val: Option<String> = r.get(i)?;
+								publ.$field.set(val);
+							}
+
+							i += 2;
+						)+
+						Ok(())
+					}
+				);
+				match result {
+					Ok(_) => println!("found"),
+					Err(rusqlite::Error::QueryReturnedNoRows) => println!("not found"),
+					r => r.unwrap() //panic
+				}
+			}
+		}
+
+		find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
 
 		println!("Got {:?}", publ);
 	}
@@ -105,7 +169,7 @@ pub struct StubMetadata {
 pub struct Metadata {
 	pub title: String,
 	pub authors: Vec<(String,String)>,
-	pub year: Option<i32>,
+	pub year: i32,
 	// ... TODO
 }
 
@@ -130,7 +194,7 @@ impl<'a> Publication<'a> {
 		self.cache.write(self);
 	}
 
-	pub fn try_get_cached(&self) {
+	fn try_get_cached(&self) {
 		self.cache.get(self);
 	}
 }
@@ -363,8 +427,7 @@ impl<'a> Publication<'a> {
 	}
 
 	pub fn metadata(&self) -> &Option<Metadata> {
-		let foo = 42;
-		self.metadata.get_or_init(|| {Some(Metadata{title:String::new(),authors:Vec::new(), year:Some(foo)})} )
+		self.metadata.get_or_init(|| {Some(Metadata{title:String::new(),authors:Vec::new(), year:42})} )
 	}
 
 	
