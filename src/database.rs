@@ -46,11 +46,11 @@ impl PublicationCache {
 	// Note: this sucks. It if you haven't called get() on this publication before, you might
 	// overwrite your cache entry :/
 
-	pub fn write(&self, publ: &Publication) {
+	pub fn write(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
 		println!("Writing {:?} to the database", publ);
 		
 		if publ.database_id.get().is_none() {
-			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![]).unwrap();
+			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![])?;
 			let rowid = self.database.last_insert_rowid();
 			println!("insert -> {}", rowid);
 			publ.database_id.set(rowid).unwrap();
@@ -92,15 +92,17 @@ impl PublicationCache {
 				}
 			}
 		}
-		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] ).unwrap();
+		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] )?;
+		Ok(())
 	}
 
-	pub fn get(&self, publ: &Publication) {
+	/// tries to get a dataset from the cache. returns true if found, false if not.
+	pub fn get(&self, publ: &Publication) -> Result<bool,rusqlite::Error> {
 		println!("Trying to get {:?} from the database", publ);
 
 		macro_rules! find_by {
 			([ $( $idfield:ident ),+ ], [ $( $field:ident ),+ ] ) =>
-			{
+			{{
 				let mut query = "SELECT id".to_string() +
 				$(
 					", " + stringify!($field) +
@@ -124,14 +126,14 @@ impl PublicationCache {
 					params,
 					|r| { // this function is executed when there is exactly one matching row
 						let mut i = 0;
-						publ.database_id.set(r.get(i)?);
+						publ.database_id.set(r.get(i)?); // TODO "safe set" that is ok when either a value was set, or the new value equals the old value. and fails otherwise.
 						i+=1;
 						$(
 							let is_cached: bool = r.get(i+1)?;
 
 							if is_cached {
 								let val: Option<String> = r.get(i)?;
-								publ.$field.set(val);
+								publ.$field.set(val); // TODO "safe set"
 							}
 
 							i += 2;
@@ -140,16 +142,16 @@ impl PublicationCache {
 					}
 				);
 				match result {
-					Ok(_) => println!("found"),
-					Err(rusqlite::Error::QueryReturnedNoRows) => println!("not found"),
-					r => r.unwrap() //panic
+					Ok(_) => Ok(true),
+					Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+					Err(e) => Err(e)
 				}
-			}
+			}}
 		}
 
-		find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
-
+		let result = find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
 		println!("Got {:?}", publ);
+		return result;
 	}
 }
 
@@ -191,11 +193,11 @@ pub struct Publication<'a> {
 
 impl<'a> Publication<'a> {
 	pub fn flush_cache(&self) {
-		self.cache.write(self);
+		self.cache.write(self).unwrap();
 	}
 
 	fn try_get_cached(&self) {
-		self.cache.get(self);
+		self.cache.get(self).unwrap();
 	}
 }
 
@@ -387,7 +389,7 @@ impl<'a> Publication<'a> {
 
 	pub fn retrieve_pdf_from_semanticscholar(&self) {
 		if let Ok(url) = self.scrape_pdf_from_semanticscholar() {
-			self.pdf.set(Some(url));
+			self.pdf.set(Some(url)).unwrap();
 		}
 	}
 
@@ -411,7 +413,7 @@ impl<'a> Publication<'a> {
 	}
 
 	fn fill_from_semanticscholar(&self, result: semanticscholar::Work) {
-		if let Some(value) = result.arxiv_id { self.arxiv.set(Some(value)); }
+		if let Some(value) = result.arxiv_id { self.arxiv.set(Some(value)); } // TODO: lots of "safe set"
 		if let Some(value) = result.doi { self.doi.set(Some(value)); }
 		if let Some(value) = result.paper_id { self.semanticscholar.set(Some(value)); }
 		self.stubmetadata.set( StubMetadata {
@@ -426,11 +428,6 @@ impl<'a> Publication<'a> {
 		}
 	}
 
-	pub fn metadata(&self) -> &Option<Metadata> {
-		self.metadata.get_or_init(|| {Some(Metadata{title:String::new(),authors:Vec::new(), year:42})} )
-	}
-
-	
 	smart_getter!(cited_by: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
 	smart_getter!(references: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
 	smart_getter!(pdf: Option<String>, [retrieve_pdf_from_semanticscholar]);
