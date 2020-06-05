@@ -58,6 +58,13 @@ impl PublicationCache {
 					FOREIGN KEY (cited) REFERENCES cache,\
 					FOREIGN KEY (citing) REFERENCES cache)",
 					rusqlite::NO_PARAMS)?;
+				db.execute("CREATE TABLE stub_authors(\
+					publication INTEGER,\
+					author TEXT,\
+					idx INTEGER,\
+					PRIMARY KEY (publication, author),\
+					FOREIGN KEY (publication) REFERENCES cache)",
+					rusqlite::NO_PARAMS)?;
 				Ok(db)
 			})?;
 		Ok(PublicationCache {
@@ -159,14 +166,20 @@ impl PublicationCache {
 						"metadata_cached = ?, " +
 						"stub_title = ?" +
 						" WHERE id = ?";
-
 					println!("cache.write -> {}", query);
+					self.database.execute(&query, params)?;
 
-					self.database.execute(&query, params)
+					// don't forget to write the authors array. and to clean it first
+					self.database.execute("DELETE FROM stub_authors WHERE publication = ?", rusqlite::params![database_id])?;
+					if let Some(stubmetadata) = publ.stubmetadata.get() {
+						for (idx,author) in stubmetadata.authors.iter().enumerate() {
+							self.database.execute("INSERT INTO stub_authors (publication, author, idx) VALUES (?, ?, ?)", rusqlite::params![database_id, author, idx as i64])?;
+						}
+					}
 				}
 			}
 		}
-		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] )?;
+		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] );
 		Ok(())
 	}
 
@@ -207,23 +220,41 @@ impl PublicationCache {
 					params,
 					|r| { // this function is executed when there is exactly one matching row
 						let mut i = 0;
-						publ.database_id.set(r.get(i)?); // TODO "safe set" that is ok when either a value was set, or the new value equals the old value. and fails otherwise.
+						let dbid: i64 = r.get(i)?;
+						publ.database_id.set(dbid); // TODO "safe set" that is ok when either a value was set, or the new value equals the old value. and fails otherwise.
 						i+=1;
 						$(
 							let is_cached: bool = r.get(i+1)?;
 
 							if is_cached {
-								let val: Option<String> = r.get(i)?;
+								let val = r.get(i)?;
 								publ.$field.set(val); // TODO "safe set"
 							}
 
 							i += 2;
 						)+
-						Ok(())
+						Ok((dbid))
 					}
 				);
 				match result {
-					Ok(_) => Ok(true),
+					Ok(dbid) => {
+						// we still need to read the "nontrivial" fields such as (stub_)metadata.
+						let mut stubmetadata = StubMetadata{ title: String::new(), authors: Vec::new() };
+						let mut stmt = self.database.prepare(
+							"SELECT author FROM stub_authors WHERE publication = ? ORDER BY idx"
+						)?;
+						let mut rows = stmt.query(rusqlite::params![dbid])?;
+						while let Some(row) = rows.next()? {
+							stubmetadata.authors.push(row.get(0)?);
+						}
+						stubmetadata.title = self.database.query_row(
+							"SELECT stub_title FROM cache WHERE id = ?",
+							rusqlite::params![dbid],
+							|r| r.get(0)
+						)?;
+						publ.stubmetadata.set(stubmetadata);
+						Ok(true)
+					},
 					Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
 					Err(e) => Err(e)
 				}
