@@ -14,6 +14,23 @@ pub struct PublicationCache {
 	database: rusqlite::Connection
 }
 
+trait SafeSet<T> {
+	/// Tries to store `item` in the OnceCell. Reports Ok(()) if either the OnceCell
+	/// was empty or contained exactly `item`, and Err(item_in_oncecell) if not.
+	fn safe_set(&self, item: T) -> Result<(), T>;
+}
+
+impl<T: std::cmp::PartialEq> SafeSet<T> for OnceCell<T> {
+	fn safe_set(&self, item: T) -> Result<(), T>{
+		if let Some(contained) = self.get() {
+			if item == *contained {
+				return Ok(())
+			}
+		}
+		return self.set(item);
+	}
+}
+
 impl PublicationCache {
 	/// Creates a new PublicationCache object. This may initialize a new database and create the schema, if not already existing.
 	pub fn create() -> Result<PublicationCache, rusqlite::Error> {
@@ -130,7 +147,7 @@ impl PublicationCache {
 			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![])?;
 			let rowid = self.database.last_insert_rowid();
 			println!("insert -> {}", rowid);
-			publ.database_id.set(rowid).unwrap();
+			publ.database_id.set(rowid).unwrap(); // cannot fail
 		}
 
 		// We just ensured that database_id must have a value. It's impossible for it to be None.
@@ -225,14 +242,14 @@ impl PublicationCache {
 					|r| { // this function is executed when there is exactly one matching row
 						let mut i = 0;
 						let dbid: i64 = r.get(i)?;
-						publ.database_id.set(dbid); // TODO "safe set" that is ok when either a value was set, or the new value equals the old value. and fails otherwise.
+						publ.database_id.safe_set(dbid).unwrap();
 						i+=1;
 						$(
 							let is_cached: bool = r.get(i+1)?;
 
 							if is_cached {
 								let val = r.get(i)?;
-								publ.$field.set(val); // TODO "safe set"
+								publ.$field.safe_set(val).unwrap();
 							}
 
 							i += 2;
@@ -259,7 +276,7 @@ impl PublicationCache {
 								stubmetadata.authors.push(row.get(0)?);
 							}
 							stubmetadata.title = stubtitle;
-							publ.stubmetadata.set(stubmetadata);
+							publ.stubmetadata.set(stubmetadata); // TODO not sure how to do safe set here
 						}
 						Ok(true)
 					},
