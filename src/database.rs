@@ -15,12 +15,16 @@ pub struct PublicationCache {
 }
 
 impl PublicationCache {
+	/// Creates a new PublicationCache object. This may initialize a new database and create the schema, if not already existing.
 	pub fn create() -> Result<PublicationCache, rusqlite::Error> {
 		let dbfile = "/tmp/bla.sqlite";
 		let database =
+			// try to open the DB
 			rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-			.or_else(|_: rusqlite::Error| -> rusqlite::Result<rusqlite::Connection>{
+			.or_else(|_: rusqlite::Error| -> rusqlite::Result<rusqlite::Connection> {
+				// if we failed to open it, let's create the DB
 				let db = rusqlite::Connection::open_with_flags(dbfile, rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+				// and create all tables we need.
 				db.execute("CREATE TABLE cache(\
 					id INTEGER PRIMARY KEY AUTOINCREMENT,\
 					doi TEXT UNIQUE,\
@@ -63,18 +67,20 @@ impl PublicationCache {
 
 	// Note: this sucks. It if you haven't called get() on this publication before, you might
 	// overwrite your cache entry :/
-
+	/// Writes a publication to the cache database, including its citing/referenced publications. Does not deeply recurse into these, but only shallowly stores their metadata.
 	pub fn write(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
+		// write publ's metadata (excluding cited_by/references)
 		self.write_nonrecursive(publ)?;
 
 		let dbid = publ.database_id.get().unwrap();
 
+		// for all citing/referenced publications, 1. ensure they're known to the cache and 2. store the array into the appropriate table
 		if let Some(cited_by_list) = publ.cited_by.get() {
-			for cited_by in cited_by_list {
+			for cited_by in cited_by_list { // 1
 				self.write_nonrecursive(cited_by)?;
 			}
 
-			self.database.execute("UPDATE cache SET cited_by_cached = 1 WHERE id = ?", rusqlite::params![dbid])?;
+			self.database.execute("UPDATE cache SET cited_by_cached = 1 WHERE id = ?", rusqlite::params![dbid])?; // 2
 			self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
 			for (idx,cited_by) in cited_by_list.iter().enumerate() {
 				self.database.execute("INSERT INTO cited_by (cited, citing, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, cited_by.database_id.get().unwrap(), idx as i32])?;
@@ -86,11 +92,11 @@ impl PublicationCache {
 		}
 
 		if let Some(references_list) = publ.references.get() {
-			for reference in references_list {
+			for reference in references_list { // 1
 				self.write_nonrecursive(reference)?;
 			}
 
-			self.database.execute("UPDATE cache SET references_cached = 1 WHERE id = ?", rusqlite::params![dbid])?;
+			self.database.execute("UPDATE cache SET references_cached = 1 WHERE id = ?", rusqlite::params![dbid])?; // 2
 			self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
 			for (idx,reference) in references_list.iter().enumerate() {
 				self.database.execute("INSERT INTO refs (citing, cited, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, reference.database_id.get().unwrap(), idx as i32])?;
@@ -102,29 +108,41 @@ impl PublicationCache {
 		}
 		Ok(())
 	}
+
+	/// saves the shallow metadata of a publication in the cache. This includes everything except cited_by/references
 	pub fn write_nonrecursive(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
 		println!("Writing {:?} to the database", publ);
 		
+		// If the publication does not have a database_id yet, it's not already in the database. (This is ensured in PublicationBuilder::fin() and other places) (TODO FIXME it's not!)
 		if publ.database_id.get().is_none() {
+			// Simplicity: Create a dummy entry that is filled with proper data by the update below. Remember the rowid we've just assigned.
 			self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![])?;
 			let rowid = self.database.last_insert_rowid();
 			println!("insert -> {}", rowid);
 			publ.database_id.set(rowid).unwrap();
 		}
 
+		// We just ensured that database_id must have a value. It's impossible for it to be None.
 		let database_id = publ.database_id.get().unwrap();
+
+		// Define a macro that accepts a list of identifiers (like doi, pdf, semanticscholar) and a list of metadata identifers (i.e. members of the Metadata struct) and
+		// programmatically generate the code for each field.
 		macro_rules! cache_update {
 			([ $( $var:ident ),+ ], [ $( $metafield:ident ),+ ] ) => {
 				{
-					let refs = rusqlite::params![
+					// these params are created to fit the '?' placeholders in the query below
+					let params = rusqlite::params![
+						// first, fields like doi, arxiv, pdf, ...
 						$(
-							publ.$var.get().unwrap_or(&None),
-							publ.$var.get().is_some()
+							publ.$var.get().unwrap_or(&None), // the value; condense None and Some(None) to None, but Some(Some(x)) to Some(x)
+							publ.$var.get().is_some()         // retain the information whether it was None ("didn't check") or Some(None) ("I checked, there was no result. No need to check again")
 						),+,
+						// now, all fields of Metadata
 						$(
 							publ.metadata.get().unwrap_or(&None).as_ref().map(|m| &m.$metafield)
 						),+,
 						publ.metadata.get().is_some(),
+						// Stubmetadata's title (or None)
 						publ.stubmetadata.get().map(|m| &m.title),
 						database_id
 					];
@@ -144,7 +162,7 @@ impl PublicationCache {
 
 					println!("cache.write -> {}", query);
 
-					self.database.execute(&query, refs)
+					self.database.execute(&query, params)
 				}
 			}
 		}
