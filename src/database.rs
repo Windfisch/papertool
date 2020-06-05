@@ -87,9 +87,11 @@ impl PublicationCache {
 				self.write_nonrecursive(cited_by)?;
 			}
 
+			println!("writing {}'s cited_by...", dbid);
 			self.database.execute("UPDATE cache SET cited_by_cached = 1 WHERE id = ?", rusqlite::params![dbid])?; // 2
 			self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
 			for (idx,cited_by) in cited_by_list.iter().enumerate() {
+				println!("\tid={}, doi={:?}, semschol={:?} title={:?}", cited_by.database_id.get().unwrap(), cited_by.doi.get(), cited_by.semanticscholar.get(), cited_by.title());
 				self.database.execute("INSERT INTO cited_by (cited, citing, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, cited_by.database_id.get().unwrap(), idx as i32])?;
 			}
 		}
@@ -103,9 +105,11 @@ impl PublicationCache {
 				self.write_nonrecursive(reference)?;
 			}
 
+			println!("writing {}'s references...", dbid);
 			self.database.execute("UPDATE cache SET references_cached = 1 WHERE id = ?", rusqlite::params![dbid])?; // 2
 			self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
 			for (idx,reference) in references_list.iter().enumerate() {
+				println!("\tid={}, doi={:?}, title={:?}", reference.database_id.get().unwrap(), reference.doi.get(), reference.title());
 				self.database.execute("INSERT INTO refs (citing, cited, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, reference.database_id.get().unwrap(), idx as i32])?;
 			}
 		}
@@ -239,20 +243,24 @@ impl PublicationCache {
 				match result {
 					Ok(dbid) => {
 						// we still need to read the "nontrivial" fields such as (stub_)metadata.
-						let mut stubmetadata = StubMetadata{ title: String::new(), authors: Vec::new() };
-						let mut stmt = self.database.prepare(
-							"SELECT author FROM stub_authors WHERE publication = ? ORDER BY idx"
-						)?;
-						let mut rows = stmt.query(rusqlite::params![dbid])?;
-						while let Some(row) = rows.next()? {
-							stubmetadata.authors.push(row.get(0)?);
-						}
-						stubmetadata.title = self.database.query_row(
+						let stubtitle_opt: Option<String> = self.database.query_row(
 							"SELECT stub_title FROM cache WHERE id = ?",
 							rusqlite::params![dbid],
 							|r| r.get(0)
 						)?;
-						publ.stubmetadata.set(stubmetadata);
+						if let Some(stubtitle) = stubtitle_opt {
+							// if there is actually a stub metadata cached
+							let mut stubmetadata = StubMetadata{ title: String::new(), authors: Vec::new() };
+							let mut stmt = self.database.prepare(
+								"SELECT author FROM stub_authors WHERE publication = ? ORDER BY idx"
+							)?;
+							let mut rows = stmt.query(rusqlite::params![dbid])?;
+							while let Some(row) = rows.next()? {
+								stubmetadata.authors.push(row.get(0)?);
+							}
+							stubmetadata.title = stubtitle;
+							publ.stubmetadata.set(stubmetadata);
+						}
 						Ok(true)
 					},
 					Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
@@ -369,7 +377,7 @@ impl<'a, IsFinalizable : FinalizableMarker> PublicationBuilder<'a, IsFinalizable
 impl<'a> PublicationBuilder<'a, Finalizable> {
 	/// Consumes the builder and returns the actual publication. Only available if one
 	/// publication identifier has been set already.
-	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication } // TODO: try to find the database id
+	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication.flush_cache(); self.publication }
 }
 
 macro_rules! smart_getter {
@@ -440,6 +448,18 @@ impl<'a> Publication<'a> {
 		PublicationBuilder {
 			publication: Publication::new(cache),
 			_marker: PhantomData{}
+		}
+	}
+
+	pub fn from_dbid(cache: &'a PublicationCache, id: i64) -> Result<Option<Publication<'a>>, rusqlite::Error> {
+		let tmp = Publication::new(cache);
+		tmp.database_id.set(id).unwrap(); // cannot fail
+		let found = cache.get(&tmp)?;
+		if found {
+			Ok(Some(tmp))
+		}
+		else {
+			Ok(None)
 		}
 	}
 
@@ -541,9 +561,12 @@ impl<'a> Publication<'a> {
 	pub fn get_cited_by_from_cache(&self) -> Result<(), rusqlite::Error> {
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
-			let mut stmt = self.cache.database.prepare("SELECT citing FROM cited_by WHERE cited = ? ORDER BY idx")?;
-			let mut rows = stmt.query(rusqlite::params![database_id])?;
-			self.cited_by.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+			let is_cached: bool = self.cache.database.query_row("SELECT cited_by_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
+			if is_cached {
+				let mut stmt = self.cache.database.prepare("SELECT citing FROM cited_by WHERE cited = ? ORDER BY idx")?;
+				let mut rows = stmt.query(rusqlite::params![database_id])?;
+				self.cited_by.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+			}
 		}
 		Ok(())
 	}
@@ -551,9 +574,12 @@ impl<'a> Publication<'a> {
 	pub fn get_references_from_cache(&self) -> Result<(), rusqlite::Error> {
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
-			let mut stmt = self.cache.database.prepare("SELECT cited FROM refs WHERE citing = ? ORDER BY idx")?;
-			let mut rows = stmt.query(rusqlite::params![database_id])?;
-			self.references.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+			let is_cached: bool = self.cache.database.query_row("SELECT references_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
+			if is_cached {
+				let mut stmt = self.cache.database.prepare("SELECT cited FROM refs WHERE citing = ? ORDER BY idx")?;
+				let mut rows = stmt.query(rusqlite::params![database_id])?;
+				self.references.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+			}
 		}
 		Ok(())
 	}
@@ -561,7 +587,8 @@ impl<'a> Publication<'a> {
 	fn new_from_semanticscholar(cache: &'a PublicationCache, result: semanticscholar::Work) -> Publication<'a> {
 		let ret = Publication::new(cache);
 		ret.fill_from_semanticscholar(result);
-		// TODO: try to find the database id
+		ret.try_get_cached();
+		ret.flush_cache();
 		return ret;
 	}
 
@@ -584,5 +611,26 @@ impl<'a> Publication<'a> {
 	smart_getter!(cited_by: Vec<Publication<'a>>, [ get_cited_by_from_cache, retrieve_from_semanticscholar ]);
 	smart_getter!(references: Vec<Publication<'a>>, [ get_references_from_cache, retrieve_from_semanticscholar ]);
 	smart_getter!(pdf: Option<String>, [retrieve_pdf_from_semanticscholar]);
+	smart_getter!(doi: Option<String>, [retrieve_from_semanticscholar]);
+	smart_getter!(arxiv: Option<String>, [retrieve_from_semanticscholar]);
+	smart_getter!(semanticscholar: Option<String>, [retrieve_from_semanticscholar]);
+	smart_getter!(stubmetadata: StubMetadata, [retrieve_from_semanticscholar]);
+
+	pub fn title(&self) -> Option<&String> {
+		match self.stubmetadata.get() {
+			None => None,
+			Some(sm) => Some(&sm.title)
+		}
+	}
+
+	pub fn database_id(&self) -> i64 {
+		if self.database_id.get().is_none() {
+			self.try_get_cached();
+			if self.database_id.get().is_none() {
+				self.flush_cache();
+			}
+		}
+		*self.database_id.get().unwrap() // there MUST be a database id available now.
+	}
 }
 
