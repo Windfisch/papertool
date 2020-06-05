@@ -156,6 +156,7 @@ impl PublicationCache {
 	pub fn get(&self, publ: &Publication) -> Result<bool,rusqlite::Error> {
 		println!("Trying to get {:?} from the database", publ);
 
+		// always checks database id (which is special)
 		macro_rules! find_by {
 			([ $( $idfield:ident ),+ ], [ $( $field:ident ),+ ] ) =>
 			{{
@@ -165,15 +166,21 @@ impl PublicationCache {
 					", " + stringify!($field) + "_cached" +
 				)+
 				" FROM cache WHERE 0 = 1"; // this is extended by several ORs
-				let mut params = Vec::<&str>::new();
+				let mut params = Vec::<Box<dyn rusqlite::ToSql>>::new();
 
 
-				$(
-					if let Some(Some(val)) = publ.$idfield.get() {
-						query = query + " OR " + stringify!($idfield) + " = ?";
-						params.push(val);
-					}
-				)+
+				if let Some(database_id) = publ.database_id.get() {
+					query = query + " OR id = ?";
+					params.push(Box::new(database_id));
+				}
+				else {
+					$(
+						if let Some(Some(val)) = publ.$idfield.get() {
+							query = query + " OR " + stringify!($idfield) + " = ?";
+							params.push(Box::new(val));
+						}
+					)+
+				}
 				
 				println!("cache.get -> {}", query);
 
@@ -298,6 +305,13 @@ macro_rules! build_with {
 }
 
 impl<'a, IsFinalizable : FinalizableMarker> PublicationBuilder<'a, IsFinalizable> {
+	fn database_id(self, dbid: i64) -> PublicationBuilder<'a, Finalizable> { // FIXME ugh
+		self.publication.database_id.set(dbid).unwrap();
+		PublicationBuilder{
+			publication: self.publication,
+			_marker: PhantomData{}
+		}
+	}
 	build_with!(doi: String);
 	build_with!(arxiv: String);
 	build_with!(semanticscholar: String);
@@ -462,6 +476,39 @@ impl<'a> Publication<'a> {
 		self.references.set( Vec::new() ).ok();
 	}
 
+
+	fn publ_array_from_rows(&self, rows: &mut rusqlite::Rows) -> Result<Vec<Publication<'a>>, rusqlite::Error> {
+		let mut publs = Vec::<Publication>::new();
+		while let Some(row) = rows.next()? {
+			let dbid: i64 = row.get(0)?;
+			let publ = Publication::build(self.cache).database_id(dbid).fin();
+			publ.try_get_cached();
+			publs.push(publ);
+		}
+		return Ok(publs);
+	}
+
+	// this function expects database_id to be set properly.
+	pub fn get_cited_by_from_cache(&self) -> Result<(), rusqlite::Error> {
+		// TODO this should be in database, not here.
+		if let Some(database_id) = self.database_id.get() {
+			let mut stmt = self.cache.database.prepare("SELECT citing FROM cited_by WHERE cited = ? ORDER BY idx")?;
+			let mut rows = stmt.query(rusqlite::params![database_id])?;
+			self.cited_by.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+		}
+		Ok(())
+	}
+
+	pub fn get_references_from_cache(&self) -> Result<(), rusqlite::Error> {
+		// TODO this should be in database, not here.
+		if let Some(database_id) = self.database_id.get() {
+			let mut stmt = self.cache.database.prepare("SELECT cited FROM refs WHERE citing = ? ORDER BY idx")?;
+			let mut rows = stmt.query(rusqlite::params![database_id])?;
+			self.references.set( self.publ_array_from_rows(&mut rows)?).unwrap();
+		}
+		Ok(())
+	}
+
 	fn new_from_semanticscholar(cache: &'a PublicationCache, result: semanticscholar::Work) -> Publication<'a> {
 		let ret = Publication::new(cache);
 		ret.fill_from_semanticscholar(result);
@@ -485,8 +532,8 @@ impl<'a> Publication<'a> {
 		}
 	}
 
-	smart_getter!(cited_by: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
-	smart_getter!(references: Vec<Publication<'a>>, [ retrieve_from_semanticscholar ]);
+	smart_getter!(cited_by: Vec<Publication<'a>>, [ get_cited_by_from_cache, retrieve_from_semanticscholar ]);
+	smart_getter!(references: Vec<Publication<'a>>, [ get_references_from_cache, retrieve_from_semanticscholar ]);
 	smart_getter!(pdf: Option<String>, [retrieve_pdf_from_semanticscholar]);
 }
 
