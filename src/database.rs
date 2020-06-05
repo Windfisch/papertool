@@ -34,8 +34,26 @@ impl PublicationCache {
 					metadata_cached INTEGER,\
 					stub_title TEXT,\
 					pdf TEXT,\
-					pdf_cached INTEGER);",
+					pdf_cached INTEGER,\
+					cited_by_cached INTEGER,\
+					references_cached INTEGER);",
 					rusqlite::params![])?;
+				db.execute("CREATE TABLE cited_by(\
+					cited INTEGER,\
+					citing INTEGER,\
+					idx INTEGER,\
+					PRIMARY KEY (cited, citing),\
+					FOREIGN KEY (cited) REFERENCES cache,\
+					FOREIGN KEY (citing) REFERENCES cache)",
+					rusqlite::NO_PARAMS)?;
+				db.execute("CREATE TABLE refs(\
+					citing INTEGER,\
+					cited INTEGER,\
+					idx INTEGER, \
+					PRIMARY KEY (cited, citing),\
+					FOREIGN KEY (cited) REFERENCES cache,\
+					FOREIGN KEY (citing) REFERENCES cache)",
+					rusqlite::NO_PARAMS)?;
 				Ok(db)
 			})?;
 		Ok(PublicationCache {
@@ -47,6 +65,44 @@ impl PublicationCache {
 	// overwrite your cache entry :/
 
 	pub fn write(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
+		self.write_nonrecursive(publ)?;
+
+		let dbid = publ.database_id.get().unwrap();
+
+		if let Some(cited_by_list) = publ.cited_by.get() {
+			for cited_by in cited_by_list {
+				self.write_nonrecursive(cited_by)?;
+			}
+
+			self.database.execute("UPDATE cache SET cited_by_cached = 1 WHERE id = ?", rusqlite::params![dbid])?;
+			self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
+			for (idx,cited_by) in cited_by_list.iter().enumerate() {
+				self.database.execute("INSERT INTO cited_by (cited, citing, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, cited_by.database_id.get().unwrap(), idx as i32])?;
+			}
+		}
+		else {
+			self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
+			self.database.execute("UPDATE cache SET cited_by_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
+		}
+
+		if let Some(references_list) = publ.references.get() {
+			for reference in references_list {
+				self.write_nonrecursive(reference)?;
+			}
+
+			self.database.execute("UPDATE cache SET references_cached = 1 WHERE id = ?", rusqlite::params![dbid])?;
+			self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
+			for (idx,reference) in references_list.iter().enumerate() {
+				self.database.execute("INSERT INTO refs (citing, cited, idx) VALUES(?, ?, ?)", rusqlite::params![dbid, reference.database_id.get().unwrap(), idx as i32])?;
+			}
+		}
+		else {
+			self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
+			self.database.execute("UPDATE cache SET references_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
+		}
+		Ok(())
+	}
+	pub fn write_nonrecursive(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
 		println!("Writing {:?} to the database", publ);
 		
 		if publ.database_id.get().is_none() {
@@ -250,7 +306,7 @@ impl<'a, IsFinalizable : FinalizableMarker> PublicationBuilder<'a, IsFinalizable
 impl<'a> PublicationBuilder<'a, Finalizable> {
 	/// Consumes the builder and returns the actual publication. Only available if one
 	/// publication identifier has been set already.
-	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication }
+	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication } // TODO: try to find the database id
 }
 
 macro_rules! smart_getter {
@@ -409,6 +465,7 @@ impl<'a> Publication<'a> {
 	fn new_from_semanticscholar(cache: &'a PublicationCache, result: semanticscholar::Work) -> Publication<'a> {
 		let ret = Publication::new(cache);
 		ret.fill_from_semanticscholar(result);
+		// TODO: try to find the database id
 		return ret;
 	}
 
