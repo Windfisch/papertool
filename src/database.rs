@@ -14,26 +14,74 @@ pub struct PublicationCache {
 	database: rusqlite::Connection
 }
 
+
+#[derive(Debug)]
+pub struct InconsistencyError {
+	expected: String,
+	found: String
+}
+
 trait SafeSet<T> {
 	/// Tries to store `item` in the OnceCell. Reports Ok(()) if either the OnceCell
 	/// was empty or contained exactly `item`, and Err(item_in_oncecell) if not.
-	fn safe_set(&self, item: T) -> Result<(), T>;
+	fn safe_set(&self, item: T) -> std::result::Result<(), InconsistencyError>;
+	fn conflicts(&self, item: &T) -> bool;
 }
 
-impl<T: std::cmp::PartialEq> SafeSet<T> for OnceCell<T> {
-	fn safe_set(&self, item: T) -> Result<(), T>{
+impl<T: std::cmp::PartialEq + std::fmt::Debug > SafeSet<T> for OnceCell<T> {
+	fn conflicts(&self, item: &T) -> bool {
 		if let Some(contained) = self.get() {
-			if item == *contained {
-				return Ok(())
+			if *item != *contained {
+				return true;
 			}
 		}
-		return self.set(item);
+		return false;
+	}
+
+	fn safe_set(&self, item: T) -> std::result::Result<(), InconsistencyError> {
+		if self.conflicts(&item) {
+			return Err(InconsistencyError{
+				expected: format!("{:?}", item),
+				found: format!("{:?}", self.get().unwrap())
+			});
+		}
+		else {
+			self.set(item).ok(); // we don't care if this fails
+			return Ok(())
+		}
 	}
 }
 
+#[derive(Debug)]
+pub enum InconsistencyType {
+	Conflict,
+	NonUnique
+}
+
+#[derive(Debug)]
+pub enum MyError {
+	Sqlite(rusqlite::Error),
+	Inconsistency(InconsistencyType),
+	Retrieve(RetrieveError)
+}
+
+impl From<rusqlite::Error> for MyError {
+	fn from(e: rusqlite::Error) -> MyError {
+		MyError::Sqlite(e)
+	}
+}
+
+impl From<RetrieveError> for MyError {
+	fn from(e: RetrieveError) -> MyError {
+		MyError::Retrieve(e)
+	}
+}
+
+type Result<T> = std::result::Result<T, MyError>;
+
 impl PublicationCache {
 	/// Creates a new PublicationCache object. This may initialize a new database and create the schema, if not already existing.
-	pub fn create() -> Result<PublicationCache, rusqlite::Error> {
+	pub fn create() -> Result<PublicationCache> {
 		let dbfile = "/tmp/bla.sqlite";
 		let database =
 			// try to open the DB
@@ -92,7 +140,7 @@ impl PublicationCache {
 	// Note: this sucks. It if you haven't called get() on this publication before, you might
 	// overwrite your cache entry :/
 	/// Writes a publication to the cache database, including its citing/referenced publications. Does not deeply recurse into these, but only shallowly stores their metadata.
-	pub fn write(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
+	pub fn write(&self, publ: &Publication) -> Result<()> {
 		// write publ's metadata (excluding cited_by/references)
 		self.write_nonrecursive(publ)?;
 
@@ -138,7 +186,7 @@ impl PublicationCache {
 	}
 
 	/// saves the shallow metadata of a publication in the cache. This includes everything except cited_by/references
-	pub fn write_nonrecursive(&self, publ: &Publication) -> Result<(), rusqlite::Error> {
+	pub fn write_nonrecursive(&self, publ: &Publication) -> Result<()> {
 		println!("Writing {:?} to the database", publ);
 		
 		// If the publication does not have a database_id yet, it's not already in the database. (This is ensured in PublicationBuilder::fin() and other places) (TODO FIXME it's not!)
@@ -204,14 +252,19 @@ impl PublicationCache {
 		Ok(())
 	}
 
-	/// tries to get a dataset from the cache. returns true if found, false if not.
-	pub fn get(&self, publ: &Publication) -> Result<bool,rusqlite::Error> {
+	/// Tries to get a dataset from the cache. Returns any entry where at least one of the identifiers like doi, arxiv, ... match.
+	/// Returns true if found, false if not.
+	/// Returns Err(MyError::Inconsistency(...)) if either a conflict between the cached IDs and self's IDs is found, or
+	/// if more than one database rows match the query. This can happen due to wrong data sources and must be resolved by the user.
+	/// Returns Err(SqliteError(...)) if a database error occurred. (This should not happen.)
+	pub fn get(&self, publ: &Publication) -> Result<bool> {
 		println!("Trying to get {:?} from the database", publ);
 
 		// always checks database id (which is special)
 		macro_rules! find_by {
 			([ $( $idfield:ident ),+ ], [ $( $field:ident ),+ ] ) =>
 			{{
+				// build a query string that selects all $fields
 				let mut query = "SELECT id".to_string() +
 				$(
 					", " + stringify!($field) +
@@ -220,12 +273,13 @@ impl PublicationCache {
 				" FROM cache WHERE 0 = 1"; // this is extended by several ORs
 				let mut params = Vec::<Box<dyn rusqlite::ToSql>>::new();
 
-
 				if let Some(database_id) = publ.database_id.get() {
+					// if there's a database id given, only use that for search
 					query = query + " OR id = ?";
 					params.push(Box::new(database_id));
 				}
 				else {
+					// if not, add all applicable id conditions
 					$(
 						if let Some(Some(val)) = publ.$idfield.get() {
 							query = query + " OR " + stringify!($idfield) + " = ?";
@@ -235,31 +289,56 @@ impl PublicationCache {
 				}
 				
 				println!("cache.get -> {}", query);
+				
+				// ok, finally perform the query
+				let mut stmt = self.database.prepare(&query)?;
+				let mut rows = stmt.query(params)?;
 
-				let result = self.database.query_row(
-					&query,
-					params,
-					|r| { // this function is executed when there is exactly one matching row
-						let mut i = 0;
-						let dbid: i64 = r.get(i)?;
-						publ.database_id.safe_set(dbid).unwrap();
-						i+=1;
+				// We want exactly one row in the result. 
+				let result = match rows.next()? {
+					None => Ok(false), // if we got zero rows, return "Not found"
+					Some(row) => {
+						// we go ahead although we don't know yet whether this
+						// is the only row. this is checked later (when the changes
+						// to self have already been made). That's not optimal, but
+						// does not really hurt. This is because this stupid API won't
+						// let me find out the number of rows (╯°□°）╯︵ ┻━┻
+
+						let dbid: i64 = row.get(0)?;
+						
+						// first check whether any fields from the database conflict with ours
+						let mut conflict = false;
+						let mut i = 1;
 						$(
-							let is_cached: bool = r.get(i+1)?;
-
+							let is_cached: bool = row.get(i+1)?;
 							if is_cached {
-								let val = r.get(i)?;
+								let val = row.get(i)?;
+								if publ.$field.conflicts(&val) {
+									conflict = true;
+								}
+							}
+
+							i += 2;
+						)+
+						
+						if conflict {
+							return Err(MyError::Inconsistency(InconsistencyType::Conflict));
+						}
+
+						// then, if there was no conflict, actually apply these fields
+						publ.database_id.safe_set(dbid).unwrap();
+						i = 1;
+						$(
+							let is_cached: bool = row.get(i+1)?;
+							if is_cached {
+								let val = row.get(i)?;
 								publ.$field.safe_set(val).unwrap();
 							}
 
 							i += 2;
 						)+
-						Ok((dbid))
-					}
-				);
-				match result {
-					Ok(dbid) => {
-						// we still need to read the "nontrivial" fields such as (stub_)metadata.
+
+						// we still need to read the "nontrivial" fields such as (stub_)metadata. (there is no conflict check for these, because I am lazy)
 						let stubtitle_opt: Option<String> = self.database.query_row(
 							"SELECT stub_title FROM cache WHERE id = ?",
 							rusqlite::params![dbid],
@@ -279,10 +358,15 @@ impl PublicationCache {
 							publ.stubmetadata.set(stubmetadata); // TODO not sure how to do safe set here
 						}
 						Ok(true)
-					},
-					Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-					Err(e) => Err(e)
+					}
+				};
+
+				// now we check whether that was the only row. if not, that's an error.
+				if !rows.next()?.is_none() {
+					return Err(MyError::Inconsistency(InconsistencyType::NonUnique));
 				}
+
+				result
 			}}
 		}
 
@@ -296,7 +380,7 @@ impl PublicationCache {
 /// should *usually* uniquely identify a publication (i.e.: title, authors),
 /// but there are cases where this is not sufficient. Not suitable for exporting
 /// to a BibTeX citation.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct StubMetadata {
 	pub title: String,
 	pub authors: Vec<String>,
@@ -304,7 +388,7 @@ pub struct StubMetadata {
 
 /// The complete metadata record about a publication, suitable for creating a
 /// BibTeX citation.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct Metadata {
 	pub title: String,
 	pub authors: Vec<(String,String)>,
@@ -313,6 +397,7 @@ pub struct Metadata {
 }
 
 /// Proxy object identifying a publication. 
+#[derive(Clone)]
 pub struct Publication<'a> {
 	cache: &'a PublicationCache,
 
@@ -339,7 +424,7 @@ impl<'a> Publication<'a> {
 }
 
 impl<'a> std::fmt::Debug for Publication<'a> {
-	fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(),std::fmt::Error> {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(),std::fmt::Error> {
 		f.debug_struct("Publication").
 			field("stubmetadata", &self.stubmetadata).
 			field("metadata", &self.metadata).
@@ -468,7 +553,7 @@ impl<'a> Publication<'a> {
 		}
 	}
 
-	pub fn from_dbid(cache: &'a PublicationCache, id: i64) -> Result<Option<Publication<'a>>, rusqlite::Error> {
+	pub fn from_dbid(cache: &'a PublicationCache, id: i64) -> Result<Option<Publication<'a>>> {
 		let tmp = Publication::new(cache);
 		tmp.database_id.set(id).unwrap(); // cannot fail
 		let found = cache.get(&tmp)?;
@@ -496,7 +581,7 @@ impl<'a> Publication<'a> {
 	}
 
 	/// scrapes the PDF link from the semanticscholar website, since this is not available through the api yet
-	pub fn scrape_pdf_from_semanticscholar(&self) -> Result<String, RetrieveError> {
+	pub fn scrape_pdf_from_semanticscholar(&self) -> std::result::Result<String, RetrieveError> {
 		use soup::QueryBuilderExt;
 		use soup::NodeExt;
 
@@ -563,7 +648,7 @@ impl<'a> Publication<'a> {
 	}
 
 
-	fn publ_array_from_rows(&self, rows: &mut rusqlite::Rows) -> Result<Vec<Publication<'a>>, rusqlite::Error> {
+	fn publ_array_from_rows(&self, rows: &mut rusqlite::Rows) -> Result<Vec<Publication<'a>>> {
 		let mut publs = Vec::<Publication>::new();
 		while let Some(row) = rows.next()? {
 			let dbid: i64 = row.get(0)?;
@@ -575,7 +660,7 @@ impl<'a> Publication<'a> {
 	}
 
 	// this function expects database_id to be set properly.
-	pub fn get_cited_by_from_cache(&self) -> Result<(), rusqlite::Error> {
+	pub fn get_cited_by_from_cache(&self) -> Result<()> {
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
 			let is_cached: bool = self.cache.database.query_row("SELECT cited_by_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
@@ -588,7 +673,7 @@ impl<'a> Publication<'a> {
 		Ok(())
 	}
 
-	pub fn get_references_from_cache(&self) -> Result<(), rusqlite::Error> {
+	pub fn get_references_from_cache(&self) -> Result<()> {
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
 			let is_cached: bool = self.cache.database.query_row("SELECT references_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
