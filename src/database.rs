@@ -15,6 +15,32 @@ pub struct PublicationCache {
 }
 
 
+trait Prettyable {
+	fn pretty(&self) -> String;
+}
+
+impl<T: Display> Prettyable for Option<T> {
+	fn pretty(&self) -> String {
+		if let Some(val) = self {
+			format!("{}", val)
+		}
+		else {
+			"<none>".into()
+		}
+	}
+}
+
+impl<T: Prettyable> Prettyable for OnceCell<T> {
+	fn pretty(&self) -> String {
+		if let Some(val) = self.get() {
+			val.pretty()
+		}
+		else {
+			"<?>".into()
+		}
+	}
+}
+
 #[derive(Debug)]
 pub struct InconsistencyError {
 	expected: String,
@@ -713,9 +739,28 @@ impl<'a> Publication<'a> {
 	}
 
 	fn fill_from_semanticscholar(&self, result: semanticscholar::Work) -> Result<()> {
-		if let Some(value) = result.arxiv_id { self.arxiv.set(Some(value)); } // TODO: lots of "safe set"
-		if let Some(value) = result.doi { self.doi.set(Some(value)); }
-		if let Some(value) = result.paper_id { self.semanticscholar.set(Some(value)); }
+		// First, set the semanticscholar id and try to find that ID in our cache.
+		// This is needed, because the semanticscholar data might be wrong, esp. the DOI.
+		// Only the semanticscholar ID can really be trusted, for everything else, we prefer
+		// what's already in our DB if we have a match.
+		if let Some(value) = result.paper_id {
+			self.semanticscholar.safe_set(Some(value)).unwrap();
+			self.try_get_cached();
+		}
+
+		// Now, set
+		if let Some(value) = result.arxiv_id {
+			if self.arxiv.safe_set(Some(value.clone())).is_err() {
+				println!("Warning: semanticscholar {} returned arxiv {}, but our cache says {}",
+					self.semanticscholar.pretty(), value, self.arxiv.pretty());
+			}
+		}
+		if let Some(value) = result.doi {
+			if self.doi.safe_set(Some(value.clone())).is_err() {
+				println!("Warning: semanticscholar {} returned doi {}, but our cache says {:?}",
+					self.semanticscholar.pretty(), value, self.doi.pretty());
+			}
+		}
 		self.stubmetadata.set( StubMetadata {
 			title: result.title.unwrap_or("<No title>".to_string()),
 			authors: result.authors.into_iter().map(|a| { a.name.unwrap_or("<No name>".to_string()) }).collect()
