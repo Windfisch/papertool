@@ -745,7 +745,7 @@ impl<'a> Publication<'a> {
 		// what's already in our DB if we have a match.
 		if let Some(value) = result.paper_id {
 			self.semanticscholar.safe_set(Some(value)).unwrap();
-			self.try_get_cached();
+			self.try_get_cached()?;
 		}
 
 		// Now, set
