@@ -61,7 +61,7 @@ pub enum InconsistencyType {
 #[derive(Debug)]
 pub enum MyError {
 	Sqlite(rusqlite::Error),
-	Inconsistency(InconsistencyType),
+	Inconsistency(InconsistencyType, PublicationData),
 	Retrieve(RetrieveError)
 }
 
@@ -77,7 +77,7 @@ impl From<RetrieveError> for MyError {
 	}
 }
 
-type Result<T> = std::result::Result<T, MyError>;
+pub type Result<T> = std::result::Result<T, MyError>;
 
 impl PublicationCache {
 	/// Creates a new PublicationCache object. This may initialize a new database and create the schema, if not already existing.
@@ -314,6 +314,7 @@ impl PublicationCache {
 							if is_cached {
 								let val = row.get(i)?;
 								if publ.$field.conflicts(&val) {
+									println!("ERROR: conflicting values for {:?}: '{:?}' vs '{:?}'", stringify!($field), val, publ.$field.get().unwrap());
 									conflict = true;
 								}
 							}
@@ -322,7 +323,7 @@ impl PublicationCache {
 						)+
 						
 						if conflict {
-							return Err(MyError::Inconsistency(InconsistencyType::Conflict));
+							return Err(MyError::Inconsistency(InconsistencyType::Conflict, publ.data.clone()));
 						}
 
 						// then, if there was no conflict, actually apply these fields
@@ -363,7 +364,7 @@ impl PublicationCache {
 
 				// now we check whether that was the only row. if not, that's an error.
 				if !rows.next()?.is_none() {
-					return Err(MyError::Inconsistency(InconsistencyType::NonUnique));
+					return Err(MyError::Inconsistency(InconsistencyType::NonUnique, publ.data.clone()));
 				}
 
 				result
@@ -400,17 +401,30 @@ pub struct Metadata {
 #[derive(Clone)]
 pub struct Publication<'a> {
 	cache: &'a PublicationCache,
+	data: PublicationData,
+	cited_by: OnceCell<Vec<Publication<'a>>>,
+	references: OnceCell<Vec<Publication<'a>>>,
+}
 
+use std::ops::Deref;
+impl<'a> Deref for Publication<'a> {
+	type Target = PublicationData;
+
+	fn deref(&self) -> &PublicationData {
+		&self.data
+	}
+}
+
+
+#[derive(Clone,Debug)]
+pub struct PublicationData {
 	database_id: OnceCell<i64>,
 	stubmetadata: OnceCell<StubMetadata>,
 	metadata: OnceCell<Option<Metadata>>,
 	doi: OnceCell<Option<String>>,
 	arxiv: OnceCell<Option<String>>,
 	pdf: OnceCell<Option<String>>,
-	semanticscholar: OnceCell<Option<String>>,
-
-	cited_by: OnceCell<Vec<Publication<'a>>>,
-	references: OnceCell<Vec<Publication<'a>>>,
+	semanticscholar: OnceCell<Option<String>>
 }
 
 impl<'a> Publication<'a> {
@@ -418,8 +432,8 @@ impl<'a> Publication<'a> {
 		self.cache.write(self).unwrap();
 	}
 
-	fn try_get_cached(&self) {
-		self.cache.get(self).unwrap();
+	fn try_get_cached(&self) -> Result<bool> {
+		self.cache.get(self)
 	}
 }
 
@@ -479,33 +493,33 @@ impl<'a, IsFinalizable : FinalizableMarker> PublicationBuilder<'a, IsFinalizable
 impl<'a> PublicationBuilder<'a, Finalizable> {
 	/// Consumes the builder and returns the actual publication. Only available if one
 	/// publication identifier has been set already.
-	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached(); self.publication.flush_cache(); self.publication }
+	pub fn fin(self) -> Publication<'a> { self.publication.try_get_cached().unwrap(); self.publication.flush_cache(); self.publication }
 }
 
 macro_rules! smart_getter {
 	( $what:ident: Option<$type:ty>, [ $( $retriever:ident ),+ ] ) => {
 		#[allow(unused)]
-		pub fn $what(&self) -> &Option<$type> {
+		pub fn $what(&self) -> Result<&Option<$type>> {
 			if self.$what.get().is_none() {
 				$(
-					if self.$what.get().is_none() { self.$retriever(); }
+					if self.$what.get().is_none() { self.$retriever()?; }
 				)+
 				if self.$what.get().is_none() { println!("not found :("); self.$what.set(None); }
 				self.flush_cache();
 			}
-			return self.$what.get().unwrap();
+			return Ok(self.$what.get().unwrap());
 		}
 	};
 	( $what:ident: $type:ty, [ $( $retriever:ident ),+ ] ) => {
 		#[allow(unused)]
-		pub fn $what(&self) -> &$type {
+		pub fn $what(&self) -> Result<&$type> {
 			if self.$what.get().is_none() {
 				$(
-					if self.$what.get().is_none() { self.$retriever(); }
+					if self.$what.get().is_none() { self.$retriever()?; }
 				)+
 				self.flush_cache();
 			}
-			return self.$what.get().unwrap();
+			return Ok(self.$what.get().unwrap());
 		}
 	}
 }
@@ -568,13 +582,15 @@ impl<'a> Publication<'a> {
 	fn new(cache: &'a PublicationCache) -> Publication<'a> {
 		Publication {
 			cache,
-			database_id: OnceCell::new(),
-			stubmetadata: OnceCell::new(),
-			metadata: OnceCell::new(),
-			doi: OnceCell::new(),
-			arxiv: OnceCell::new(),
-			pdf: OnceCell::new(),
-			semanticscholar: OnceCell::new(),
+			data: PublicationData {
+				database_id: OnceCell::new(),
+				stubmetadata: OnceCell::new(),
+				metadata: OnceCell::new(),
+				doi: OnceCell::new(),
+				arxiv: OnceCell::new(),
+				pdf: OnceCell::new(),
+				semanticscholar: OnceCell::new()
+			},
 			cited_by: OnceCell::new(),
 			references: OnceCell::new()
 		}
@@ -628,23 +644,25 @@ impl<'a> Publication<'a> {
 		}
 	}
 
-	pub fn retrieve_pdf_from_semanticscholar(&self) {
+	pub fn retrieve_pdf_from_semanticscholar(&self) -> Result<()> {
 		if let Ok(url) = self.scrape_pdf_from_semanticscholar() {
 			self.pdf.set(Some(url)).unwrap();
 		}
+		Ok(())
 	}
 
 	/// queries the semanticscholar API. this gives some metadata, cited-by and references, but not pdf.
-	pub fn retrieve_from_semanticscholar(&self) {
+	pub fn retrieve_from_semanticscholar(&self) -> Result<()> {
 		println!("**** RETRIEVING FROM SEMANTICSCHOLAR ****");
 		let client = semanticscholar::Client::new();
 		let mut result : Option<semanticscholar::Work> = None;
 		if result.is_none() { if let Some(Some(semanticscholar)) = self.semanticscholar.get() { result = client.work(semanticscholar).ok(); } }
 		if result.is_none() { if let Some(Some(doi)) = self.doi.get() { result = client.work(doi).ok(); } }
 		if result.is_none() { if let Some(Some(arxiv)) = self.arxiv.get() { result = client.work(&("arXiv:".to_string() + arxiv)).ok(); } }
-		Publication::fill_from_semanticscholar(self, result.expect("Could not find in semanticscholar"));
+		Publication::fill_from_semanticscholar(self, result.expect("Could not find in semanticscholar"))?;
 		self.cited_by.set( Vec::new() ).ok(); // if no cited_by was in the result, ensure this is the empty vector
 		self.references.set( Vec::new() ).ok();
+		Ok(())
 	}
 
 
@@ -653,7 +671,7 @@ impl<'a> Publication<'a> {
 		while let Some(row) = rows.next()? {
 			let dbid: i64 = row.get(0)?;
 			let publ = Publication::build(self.cache).database_id(dbid).fin();
-			publ.try_get_cached();
+			publ.try_get_cached()?;
 			publs.push(publ);
 		}
 		return Ok(publs);
@@ -686,15 +704,15 @@ impl<'a> Publication<'a> {
 		Ok(())
 	}
 
-	fn new_from_semanticscholar(cache: &'a PublicationCache, result: semanticscholar::Work) -> Publication<'a> {
+	fn new_from_semanticscholar(cache: &'a PublicationCache, result: semanticscholar::Work) -> Result<Publication<'a>> {
 		let ret = Publication::new(cache);
-		ret.fill_from_semanticscholar(result);
-		ret.try_get_cached();
+		ret.fill_from_semanticscholar(result)?;
+		ret.try_get_cached()?;
 		ret.flush_cache();
-		return ret;
+		return Ok(ret);
 	}
 
-	fn fill_from_semanticscholar(&self, result: semanticscholar::Work) {
+	fn fill_from_semanticscholar(&self, result: semanticscholar::Work) -> Result<()> {
 		if let Some(value) = result.arxiv_id { self.arxiv.set(Some(value)); } // TODO: lots of "safe set"
 		if let Some(value) = result.doi { self.doi.set(Some(value)); }
 		if let Some(value) = result.paper_id { self.semanticscholar.set(Some(value)); }
@@ -703,11 +721,14 @@ impl<'a> Publication<'a> {
 			authors: result.authors.into_iter().map(|a| { a.name.unwrap_or("<No name>".to_string()) }).collect()
 		});
 		if !result.citations.is_empty() {
-			self.cited_by.set(result.citations.into_iter().map(|work| { Publication::new_from_semanticscholar(self.cache, work) }).collect());
+			let r: Result<Vec<_>> = result.citations.into_iter().map(|work| { Publication::new_from_semanticscholar(self.cache, work) }).collect();
+			self.cited_by.set(r?);
 		}
 		if !result.references.is_empty() {
-			self.references.set(result.references.into_iter().map(|work| { Publication::new_from_semanticscholar(self.cache, work) }).collect());
+			let r: Result<Vec<_>> = result.references.into_iter().map(|work| { Publication::new_from_semanticscholar(self.cache, work) }).collect();
+			self.references.set(r?);
 		}
+		Ok(())
 	}
 
 	smart_getter!(cited_by: Vec<Publication<'a>>, [ get_cited_by_from_cache, retrieve_from_semanticscholar ]);
@@ -727,7 +748,7 @@ impl<'a> Publication<'a> {
 
 	pub fn database_id(&self) -> i64 {
 		if self.database_id.get().is_none() {
-			self.try_get_cached();
+			self.try_get_cached().unwrap(); // TODO this should be handled
 			if self.database_id.get().is_none() {
 				self.flush_cache();
 			}
