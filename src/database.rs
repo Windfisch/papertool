@@ -278,14 +278,9 @@ impl PublicationCache {
 		cache_update!([doi, arxiv, semanticscholar, pdf], [title, year] );
 		Ok(())
 	}
-
-	/// Tries to get a dataset from the cache. Returns any entry where at least one of the identifiers like doi, arxiv, ... match.
-	/// Returns true if found, false if not.
-	/// Returns Err(MyError::Inconsistency(...)) if either a conflict between the cached IDs and self's IDs is found, or
-	/// if more than one database rows match the query. This can happen due to wrong data sources and must be resolved by the user.
-	/// Returns Err(SqliteError(...)) if a database error occurred. (This should not happen.)
-	pub fn get(&self, publ: &PublicationData) -> Result<bool> {
-		println!("Trying to get {:?} from the database", publ);
+	
+	pub fn get_all(&self, publ: &PublicationData) -> Result<Vec<PublicationData>> {
+		println!("Trying to get matching entries for {:?} from the database", publ);
 
 		// always checks database id (which is special)
 		macro_rules! find_by {
@@ -320,87 +315,110 @@ impl PublicationCache {
 				// ok, finally perform the query
 				let mut stmt = self.database.prepare(&query)?;
 				let mut rows = stmt.query(params)?;
+				let mut query_results = Vec::<PublicationData>::new();
 
-				// We want exactly one row in the result. 
-				let result = match rows.next()? {
-					None => Ok(false), // if we got zero rows, return "Not found"
-					Some(row) => {
-						// we go ahead although we don't know yet whether this
-						// is the only row. this is checked later (when the changes
-						// to self have already been made). That's not optimal, but
-						// does not really hurt. This is because this stupid API won't
-						// let me find out the number of rows (╯°□°）╯︵ ┻━┻
+				// Parse all results into a Vec of PublicationData
+				while let Some(row) = rows.next()? {
+					let data: PublicationData = PublicationData::new();
 
-						let dbid: i64 = row.get(0)?;
-						
-						// first check whether any fields from the database conflict with ours
-						let mut conflict = false;
-						let mut i = 1;
-						$(
-							let is_cached: bool = row.get(i+1)?;
-							if is_cached {
-								let val = row.get(i)?;
-								if publ.$field.conflicts(&val) {
-									println!("ERROR: conflicting values for {:?}: '{:?}' vs '{:?}'", stringify!($field), val, publ.$field.get().unwrap());
-									conflict = true;
-								}
-							}
-
-							i += 2;
-						)+
-						
-						if conflict {
-							return Err(MyError::Inconsistency(InconsistencyType::Conflict, publ.clone()));
+					let dbid: i64 = row.get(0)?;
+					data.database_id.safe_set(dbid).unwrap();
+					let mut _i = 1;
+					$(
+						let is_cached: bool = row.get(_i+1)?;
+						if is_cached {
+							let val = row.get(_i)?;
+							data.$field.safe_set(val).unwrap();
 						}
+						_i += 2;
+					)+
 
-						// then, if there was no conflict, actually apply these fields
-						publ.database_id.safe_set(dbid).unwrap();
-						i = 1;
-						$(
-							let is_cached: bool = row.get(i+1)?;
-							if is_cached {
-								let val = row.get(i)?;
-								publ.$field.safe_set(val).unwrap();
-							}
-
-							i += 2;
-						)+
-
-						// we still need to read the "nontrivial" fields such as (stub_)metadata. (there is no conflict check for these, because I am lazy)
-						let stubtitle_opt: Option<String> = self.database.query_row(
-							"SELECT stub_title FROM cache WHERE id = ?",
-							rusqlite::params![dbid],
-							|r| r.get(0)
+					// we still need to read the "nontrivial" fields such as (stub_)metadata.
+					let stubtitle_opt: Option<String> = self.database.query_row(
+						"SELECT stub_title FROM cache WHERE id = ?",
+						rusqlite::params![dbid],
+						|r| r.get(0)
+					)?;
+					if let Some(stubtitle) = stubtitle_opt {
+						// if there is actually a stub metadata cached
+						let mut stubmetadata = StubMetadata{ title: String::new(), authors: Vec::new() };
+						let mut stmt = self.database.prepare(
+							"SELECT author FROM stub_authors WHERE publication = ? ORDER BY idx"
 						)?;
-						if let Some(stubtitle) = stubtitle_opt {
-							// if there is actually a stub metadata cached
-							let mut stubmetadata = StubMetadata{ title: String::new(), authors: Vec::new() };
-							let mut stmt = self.database.prepare(
-								"SELECT author FROM stub_authors WHERE publication = ? ORDER BY idx"
-							)?;
-							let mut rows = stmt.query(rusqlite::params![dbid])?;
-							while let Some(row) = rows.next()? {
-								stubmetadata.authors.push(row.get(0)?);
-							}
-							stubmetadata.title = stubtitle;
-							publ.stubmetadata.set(stubmetadata); // TODO not sure how to do safe set here
+						let mut rows = stmt.query(rusqlite::params![dbid])?;
+						while let Some(row) = rows.next()? {
+							stubmetadata.authors.push(row.get(0)?);
 						}
-						Ok(true)
+						stubmetadata.title = stubtitle;
+						data.stubmetadata.set(stubmetadata).unwrap();
 					}
-				};
 
-				// now we check whether that was the only row. if not, that's an error.
-				if !rows.next()?.is_none() {
-					return Err(MyError::Inconsistency(InconsistencyType::NonUnique, publ.clone()));
+					query_results.push(data);
 				}
 
-				result
+				Ok(query_results)
 			}}
 		}
 
-		let result = find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
+		find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf])
+	}
+
+	/// Tries to get a dataset from the cache. Returns any entry where at least one of the identifiers like doi, arxiv, ... match.
+	/// Returns true if found, false if not.
+	/// Returns Err(MyError::Inconsistency(...)) if either a conflict between the cached IDs and self's IDs is found, or
+	/// if more than one database rows match the query. This can happen due to wrong data sources and must be resolved by the user.
+	/// Returns Err(SqliteError(...)) if a database error occurred. (This should not happen.)
+	pub fn get(&self, publ: &PublicationData) -> Result<bool> {
+		println!("Trying to get {:?} from the database", publ);
+
+		let mut matches = self.get_all(publ)?;
+
+		if matches.len() > 1 {
+			return Err(MyError::Inconsistency(InconsistencyType::NonUnique, publ.clone()));
+		}
+
+		if matches.len() == 0 {
+			return Ok(false);
+		}
+
+		let mut data = matches.pop().unwrap(); // guaranteed to succeed
+
+		// always checks database id (which is special)
+		macro_rules! update_from {
+			([ $( $idfield:ident ),+ ], [ $( $field:ident ),+ ] ) =>
+			{{
+				// first check whether any fields from the database conflict with ours
+				let mut conflict = false;
+				$(
+					if let Some(val) = data.$field.get() {
+						if publ.$field.conflicts(val) {
+							println!("ERROR: conflicting values for {:?}: '{:?}' vs '{:?}'", stringify!($field), val, publ.$field.get().unwrap());
+							conflict = true;
+						}
+					}
+				)+
+				
+				if conflict {
+					return Err(MyError::Inconsistency(InconsistencyType::Conflict, publ.clone()));
+				}
+
+				// then, if there was no conflict, actually apply these fields
+				publ.database_id.safe_set(*data.database_id.get().unwrap()).unwrap();
+				$(
+					if let Some(val) = data.$field.take() {
+						publ.$field.safe_set(val).unwrap();
+					}
+				)+
+
+				if let Some(stubmetadata) = data.stubmetadata.take() {
+					publ.stubmetadata.set(stubmetadata); // TODO not sure how to do safe set here
+				}
+			}}
+		}
+
+		update_from!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
 		println!("Got {:?}", publ);
-		return result;
+		return Ok(true);
 	}
 
 	pub fn solve_conflict(&self, reproducer: &PublicationData) {
@@ -455,6 +473,20 @@ pub struct PublicationData {
 	arxiv: OnceCell<Option<String>>,
 	pdf: OnceCell<Option<String>>,
 	semanticscholar: OnceCell<Option<String>>
+}
+
+impl PublicationData {
+	pub fn new() -> PublicationData {
+		PublicationData {
+			database_id: OnceCell::new(),
+			stubmetadata: OnceCell::new(),
+			metadata: OnceCell::new(),
+			doi: OnceCell::new(),
+			arxiv: OnceCell::new(),
+			pdf: OnceCell::new(),
+			semanticscholar: OnceCell::new()
+		}
+	}
 }
 
 impl<'a> Publication<'a> {
@@ -612,15 +644,7 @@ impl<'a> Publication<'a> {
 	fn new(cache: &'a PublicationCache) -> Publication<'a> {
 		Publication {
 			cache,
-			data: PublicationData {
-				database_id: OnceCell::new(),
-				stubmetadata: OnceCell::new(),
-				metadata: OnceCell::new(),
-				doi: OnceCell::new(),
-				arxiv: OnceCell::new(),
-				pdf: OnceCell::new(),
-				semanticscholar: OnceCell::new()
-			},
+			data: PublicationData::new(),
 			cited_by: OnceCell::new(),
 			references: OnceCell::new()
 		}
