@@ -15,6 +15,7 @@ pub struct PublicationCache {
 }
 
 
+
 trait Prettyable {
 	fn pretty(&self) -> String;
 }
@@ -283,7 +284,7 @@ impl PublicationCache {
 	/// Returns Err(MyError::Inconsistency(...)) if either a conflict between the cached IDs and self's IDs is found, or
 	/// if more than one database rows match the query. This can happen due to wrong data sources and must be resolved by the user.
 	/// Returns Err(SqliteError(...)) if a database error occurred. (This should not happen.)
-	pub fn get(&self, publ: &Publication) -> Result<bool> {
+	pub fn get(&self, publ: &PublicationData) -> Result<bool> {
 		println!("Trying to get {:?} from the database", publ);
 
 		// always checks database id (which is special)
@@ -349,7 +350,7 @@ impl PublicationCache {
 						)+
 						
 						if conflict {
-							return Err(MyError::Inconsistency(InconsistencyType::Conflict, publ.data.clone()));
+							return Err(MyError::Inconsistency(InconsistencyType::Conflict, publ.clone()));
 						}
 
 						// then, if there was no conflict, actually apply these fields
@@ -390,7 +391,7 @@ impl PublicationCache {
 
 				// now we check whether that was the only row. if not, that's an error.
 				if !rows.next()?.is_none() {
-					return Err(MyError::Inconsistency(InconsistencyType::NonUnique, publ.data.clone()));
+					return Err(MyError::Inconsistency(InconsistencyType::NonUnique, publ.clone()));
 				}
 
 				result
@@ -400,6 +401,9 @@ impl PublicationCache {
 		let result = find_by!([doi, arxiv, semanticscholar], [doi, arxiv, semanticscholar, pdf]);
 		println!("Got {:?}", publ);
 		return result;
+	}
+
+	pub fn solve_conflict(&self, reproducer: &PublicationData) {
 	}
 }
 
@@ -459,7 +463,7 @@ impl<'a> Publication<'a> {
 	}
 
 	fn try_get_cached(&self) -> Result<bool> {
-		self.cache.get(self)
+		self.cache.get(&self.data)
 	}
 }
 
@@ -596,7 +600,7 @@ impl<'a> Publication<'a> {
 	pub fn from_dbid(cache: &'a PublicationCache, id: i64) -> Result<Option<Publication<'a>>> {
 		let tmp = Publication::new(cache);
 		tmp.database_id.set(id).unwrap(); // cannot fail
-		let found = cache.get(&tmp)?;
+		let found = cache.get(&tmp.data)?;
 		if found {
 			Ok(Some(tmp))
 		}
