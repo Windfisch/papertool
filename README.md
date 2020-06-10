@@ -18,11 +18,16 @@ This is still in an early stage of development. The "hard stuff" seems to work
 quite well already, though this is certainly not usable yet for real-world
 usage.
 
-Data sources are currently implemented or planne:
+Data sources are currently implemented or planned:
 
   - SemanticScholar for citations/references and PDF link (implemented)
   - DBLP for metadata (planned)
   - CrossRef for metadata (planned)
+
+The philosophy is to use as raw as possible data from the sources, and to
+cook them into nice BibTeX records using heuristics afterwards. This has the
+advantage that changes in heuristics can easily be implemented and affect
+*all* data, not just those retrieved after the change.
 
 Usage
 -----
