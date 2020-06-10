@@ -123,19 +123,19 @@ impl PublicationCache {
 				db.execute("CREATE TABLE cache(\
 					id INTEGER PRIMARY KEY AUTOINCREMENT,\
 					doi TEXT UNIQUE,\
-					doi_cached INTEGER,\
+					doi_cached INTEGER NOT NULL DEFAULT 0,\
 					arxiv TEXT UNIQUE,\
-					arxiv_cached INTEGER,\
+					arxiv_cached INTEGER NOT NULL DEFAULT 0,\
 					semanticscholar TEXT UNIQUE,\
-					semanticscholar_cached INTEGER,\
+					semanticscholar_cached INTEGER NOT NULL DEFAULT 0,\
 					metadata_title TEXT,\
 					metadata_year INTEGER,\
-					metadata_cached INTEGER,\
+					metadata_cached INTEGER NOT NULL DEFAULT 0,\
 					stub_title TEXT,\
 					pdf TEXT,\
-					pdf_cached INTEGER,\
-					cited_by_cached INTEGER,\
-					references_cached INTEGER);",
+					pdf_cached INTEGER NOT NULL DEFAULT 0,\
+					cited_by_cached INTEGER NOT NULL DEFAULT 0,\
+					references_cached INTEGER NOT NULL DEFAULT 0);",
 					rusqlite::params![])?;
 				db.execute("CREATE TABLE cited_by(\
 					cited INTEGER,\
