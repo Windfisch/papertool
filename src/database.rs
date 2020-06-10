@@ -191,8 +191,9 @@ impl PublicationCache {
 			}
 		}
 		else {
-			self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
-			self.database.execute("UPDATE cache SET cited_by_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
+			// FIXME do NOT do this. we do not read the reference_list always, so not knowing it for self does *not* mean that it's not known to the database!
+			//self.database.execute("DELETE FROM cited_by WHERE cited = ?", rusqlite::params![dbid])?;
+			//self.database.execute("UPDATE cache SET cited_by_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
 		}
 
 		if let Some(references_list) = publ.references.get() {
@@ -209,8 +210,9 @@ impl PublicationCache {
 			}
 		}
 		else {
-			self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
-			self.database.execute("UPDATE cache SET references_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
+			// FIXME do NOT do this. we do not read the reference_list always, so not knowing it for self does *not* mean that it's not known to the database!
+			//self.database.execute("DELETE FROM refs WHERE citing = ?", rusqlite::params![dbid])?;
+			//self.database.execute("UPDATE cache SET references_cached = 0 WHERE id = ?", rusqlite::params![dbid])?;
 		}
 		Ok(())
 	}
@@ -855,8 +857,9 @@ macro_rules! smart_getter {
 		#[allow(unused)]
 		pub fn $what(&self) -> Result<&Option<$type>> {
 			if self.$what.get().is_none() {
+				println!("trying to retrieve {}", stringify!($what));
 				$(
-					if self.$what.get().is_none() { self.$retriever()?; }
+					if self.$what.get().is_none() { println!("\t-> {}", stringify!($retriever)); self.$retriever()?; }
 				)+
 				if self.$what.get().is_none() { println!("not found :("); self.$what.set(None); }
 				self.flush_cache();
@@ -868,8 +871,9 @@ macro_rules! smart_getter {
 		#[allow(unused)]
 		pub fn $what(&self) -> Result<&$type> {
 			if self.$what.get().is_none() {
+				println!("trying to retrieve {}", stringify!($what));
 				$(
-					if self.$what.get().is_none() { self.$retriever()?; }
+					if self.$what.get().is_none() { println!("\t-> {}", stringify!($retriever)); self.$retriever()?; }
 				)+
 				self.flush_cache();
 			}
@@ -1025,10 +1029,12 @@ impl<'a> Publication<'a> {
 
 	// this function expects database_id to be set properly.
 	pub fn get_cited_by_from_cache(&self) -> Result<()> {
+		println!("trying to get cited_by from the cache for dbid {:?}", self.database_id.get());
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
 			let is_cached: bool = self.cache.database.query_row("SELECT cited_by_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
 			if is_cached {
+				println!("\tfound :)");
 				let mut stmt = self.cache.database.prepare("SELECT citing FROM cited_by WHERE cited = ? ORDER BY idx")?;
 				let mut rows = stmt.query(rusqlite::params![database_id])?;
 				self.cited_by.set( self.publ_array_from_rows(&mut rows)?).unwrap();
@@ -1038,10 +1044,13 @@ impl<'a> Publication<'a> {
 	}
 
 	pub fn get_references_from_cache(&self) -> Result<()> {
+		println!("trying to get references from the cache for dbid {:?}", self.database_id.get());
 		// TODO this should be in database, not here.
 		if let Some(database_id) = self.database_id.get() {
 			let is_cached: bool = self.cache.database.query_row("SELECT references_cached FROM cache WHERE id = ?", rusqlite::params![database_id], |r| r.get(0))?;
+			println!("\tis_cached = {} for dbid {}", is_cached, database_id);
 			if is_cached {
+				println!("\tfound :)");
 				let mut stmt = self.cache.database.prepare("SELECT cited FROM refs WHERE citing = ? ORDER BY idx")?;
 				let mut rows = stmt.query(rusqlite::params![database_id])?;
 				self.references.set( self.publ_array_from_rows(&mut rows)?).unwrap();
