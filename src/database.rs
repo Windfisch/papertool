@@ -3,10 +3,13 @@ use std::marker::PhantomData;
 use reqwest;
 use soup;
 use std::fmt::{Debug,Display};
+use std::io::*;
+
 
 use rusqlite;
 
 use semanticscholar;
+use colored::*;
 
 /// PublicationCache provides an interface to the local database that caches
 /// all external API lookups.
@@ -422,6 +425,136 @@ impl PublicationCache {
 	}
 
 	pub fn solve_conflict(&self, reproducer: &PublicationData) {
+		let matches = self.get_all(reproducer).unwrap();
+
+		println!("##########################");
+		println!("# NEED USER INTERVENTION #");
+		println!("##########################");
+		println!("Got #1 from API:\n{}", reproducer);
+		let mut all_matching_keys = Vec::<String>::new();
+		for (i, entry) in matches.iter().enumerate() {
+			macro_rules! equalkeys {
+				([ $( $field:ident ),+ ]) => {{
+					let mut matching_keys = Vec::<String>::new();
+					$(
+						if let Some(val1) = reproducer.$field.get() {
+							if let Some(val2) = entry.$field.get() {
+								if val1 == val2 {
+									matching_keys.push( stringify!($field).to_string() );
+								}
+							}
+						}
+					)+
+					matching_keys
+				}}
+			}
+			let matching_keys = equalkeys!([doi, arxiv, semanticscholar]);
+			println!("Got #{} from database due to same {}:\n{}", i+2, matching_keys.join(", ").magenta(), entry);
+			all_matching_keys.extend(matching_keys);
+		}
+
+		all_matching_keys.sort();
+		all_matching_keys.dedup();
+
+		println!("");
+		println!("Obviously, one of these {} fields is wrong. Please enter a correction using the following syntax:", all_matching_keys.join(", "));
+		println!("\t{}{}{}", 
+			"> ".bright_black(),
+			  "doi1=<insert new doi here>".magenta(),
+			                            "           to change #1's doi to something else or");
+		println!("\t{}{}{}", 
+			"> ".bright_black(),
+			  "arxiv2=-,doi2=-".magenta(),
+			                 "                      to change #2's arxiv id and doi to <none>");
+		println!("\t{}{}{}", 
+			"> ".bright_black(),
+			  "1=<...>".magenta(),
+			         "                              to change #1's id, if there is only one conflicting id");
+		print!("> ");
+		stdout().flush().ok();
+
+		'inputloop: loop {
+
+			fn prompt() {
+				println!("Please enter a correction.");
+				print!("> ");
+				stdout().flush().ok();
+			}
+
+			let mut input = String::new();
+			stdin().read_line(&mut input).expect("error: unable to read user input");
+			input = input.trim().into();
+
+			let mut ok = false;
+			
+			let commands = input.split(',');
+
+			for command in commands {
+				let mut parts: Vec<_> = command.split('=').collect();
+				
+				if parts.len() != 2 {
+					println!("error: invalid syntax in {}", command);
+					prompt();
+					continue 'inputloop;
+				}
+
+				let lvalue = parts.remove(0).trim();
+				let rvalue = parts.remove(0).trim();
+
+				fn split_num(s: &str) -> (&str, &str) {
+					for (i, c) in s.chars().enumerate() {
+						if c.is_numeric() {
+							return ( &s[0..i], &s[i..] );
+						}
+					}
+					return (s, "");
+				}
+
+				let (mut identifier, number_str) = split_num(lvalue);
+				if number_str.len() == 0 {
+					println!("error: missing number in {}", lvalue);
+					prompt();
+					continue 'inputloop;
+				}
+
+				let number = number_str.parse::<usize>().unwrap(); // cannot fail
+
+				if number > matches.len()+1 {
+					println!("error: number must be between 1 and {} in {}", matches.len()+1, lvalue);
+					prompt();
+					continue 'inputloop;
+				}
+
+				if identifier.len() == 0 {
+					if all_matching_keys.len() == 1 {
+						identifier = all_matching_keys.get(0).unwrap();
+					}
+					else {
+						println!("error: cannot leave out the id part in this situation");
+						prompt();
+						continue 'inputloop;
+					}
+				}
+
+				let new_value: Option<String> =
+					match rvalue {
+						"" => None,
+						"-" => None,
+						s => Some(s.to_string())
+					};
+
+				println!("parsed: set #{}'s {} to {:?}", number, identifier, new_value);
+				ok = true;
+			}
+
+			if ok {
+				//break 'inputloop;
+			}
+			else {
+				prompt();
+				continue 'inputloop;
+			}
+		}
 	}
 }
 
@@ -473,6 +606,43 @@ pub struct PublicationData {
 	arxiv: OnceCell<Option<String>>,
 	pdf: OnceCell<Option<String>>,
 	semanticscholar: OnceCell<Option<String>>
+}
+
+fn format_authors(authors: &Vec<String>) -> String {
+	match authors.len() {
+		0 => "?".into(),
+		1 => authors[0].clone(),
+		2 => authors.join(" and "),
+		_ => format!("{} et al.", authors[0])
+	}
+}
+
+impl Display for PublicationData {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		let (title, authors) : (String, String) = match self.stubmetadata.get() {
+			None => ("?".into(), "?".into()),
+			Some(stubmetadata) => (stubmetadata.title.clone(), format_authors(&stubmetadata.authors))
+		};
+
+		macro_rules! mk_keystrs {
+			( [ $( $field:ident . $color:ident ),+ ] ) => {{
+				let mut keystr = Vec::<String>::new();
+				$(
+					if let Some(Some(val)) = self.$field.get() {
+						keystr.push( format!("{}:{}", stringify!($field), val.$color()) );
+					}
+				)+
+				keystr
+			}}
+		}
+		let keystrs = mk_keystrs!([doi.red, arxiv.cyan, semanticscholar.purple]);
+
+		write!(f, "'{}' by {} ({})",
+			title.green(),
+			authors.blue(),
+			keystrs.join(", ")
+		)
+	}
 }
 
 impl PublicationData {

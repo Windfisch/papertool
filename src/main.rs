@@ -40,6 +40,8 @@ fn main() -> database::Result<()> {
 		Ok(_) => println!("everything is fine :)"),
 		Err(MyError::Inconsistency(kind,reproducer)) => {
 			println!("Inconsistency of kind {:?} detected! Reproducer:\n{:#?}", kind, reproducer);
+
+			cache.solve_conflict(&reproducer);
 		},
 		Err(e) => return Err(e)
 	}
