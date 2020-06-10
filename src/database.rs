@@ -4,7 +4,8 @@ use reqwest;
 use soup;
 use std::fmt::{Debug,Display};
 use std::io::*;
-
+use lazy_static::*;
+use regex;
 
 use rusqlite;
 
@@ -981,7 +982,22 @@ impl<'a> Publication<'a> {
 						for link in doc.tag("a").attr("data-heap-direct-pdf-link", "true").find_all() {
 							//println!("\t\tlink: {}", link.display());
 							match link.get("link") {
-								Some(result) => { println!("\t\t=> {}", result); return Ok(result) },
+								Some(raw_result) => {
+									println!("\t\t=> {}", raw_result);
+
+									lazy_static!{
+										static ref PDF_REGEX : regex::Regex = regex::Regex::new(r#"(http|https)://[^"]+\.pdf"#).unwrap();
+									};
+									let pdf_match = PDF_REGEX.find(&raw_result);
+									if let Some(m) = pdf_match {
+										let result = m.as_str();
+										println!("\t\t===> {}", result);
+										return Ok(result.into());
+									}
+									else {
+										println!("\t\t===> no pdf url");
+									}
+								},
 								None => ()
 							}
 						}
