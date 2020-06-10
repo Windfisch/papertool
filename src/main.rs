@@ -28,7 +28,7 @@ fn do_stuff(cache: &PublicationCache) -> database::Result<()> {
 	println!("HASS");
 
 	for publ in relevant_pubs {
-		for p in publ.references()? {
+		for p in publ.cited_by()? {
 			let counter = fnord.entry(p.database_id()).or_insert(0);
 			*counter += 1;
 		}
@@ -36,12 +36,20 @@ fn do_stuff(cache: &PublicationCache) -> database::Result<()> {
 	
 	println!("HASS2");
 
-	let mut fnord2 = Vec::<(String, u32)>::new();
+	let mut fnord2 = Vec::<(String, String, u32)>::new();
 	for (key, counter) in fnord.drain() {
 		let publ = Publication::from_dbid(&cache, key).unwrap().unwrap();
-		fnord2.push( (publ.stubmetadata()?.title.clone(), counter) );
+		
+		let pdf = 
+		if counter >= 2 {
+			match publ.pdf()? { Some(x) => x.clone(), None => "no pdf".to_string() }
+		}
+		else {
+			"didn't bother".into()
+		};
+		fnord2.push( (publ.stubmetadata()?.title.clone(), pdf, counter) );
 	}
-	fnord2.sort_by_key(|x| x.1);
+	fnord2.sort_by_key(|x| x.2);
 
 	println!("{:#?}", fnord2);
 	println!("HASS3");
