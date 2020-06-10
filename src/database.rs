@@ -423,8 +423,95 @@ impl PublicationCache {
 		println!("Got {:?}", publ);
 		return Ok(true);
 	}
+	
+	/// updates the ID fields like doi etc (but not (stub)metadata, pdf etc) for all items.
+	fn commit_conflict_solution(&self, items: Vec<PublicationData>) -> Result<()> {
+		self.database.execute("BEGIN TRANSACTION", rusqlite::NO_PARAMS)?;
+
+		let result = || -> rusqlite::Result<()> {
+			// first, add a database ID to all items that don't have one yet
+			for item in items.iter() {
+				if item.database_id.get().is_none() {
+					self.database.execute("INSERT INTO cache DEFAULT VALUES", rusqlite::params![])?;
+					let rowid = self.database.last_insert_rowid();
+					println!("insert -> {}", rowid);
+					item.database_id.set(rowid).unwrap(); // cannot fail
+				}
+			}
+
+			// second, clear all IDs from the items (so there won't be temporary UNIQUE violations later)
+			for item in items.iter() {
+				self.database.execute("UPDATE cache SET doi=NULL, arxiv=NULL, semanticscholar=NULL WHERE id=?", rusqlite::params![item.database_id.get().unwrap()])?;
+			}
+
+			// third, set the new IDs. If UNIQUE violations occur, this means that the scope of the problem is larger than expected.
+			for item in items.iter() {
+				macro_rules! update {
+					( [ $( $field:ident ),+ ] ) => {{
+						let params = rusqlite::params![
+							// first, fields like doi, arxiv, pdf, ...
+							$(
+								item.$field.get().unwrap_or(&None), // the value; condense None and Some(None) to None, but Some(Some(x)) to Some(x)
+								item.$field.get().is_some()         // retain the information whether it was None ("didn't check") or Some(None) ("I checked, there was no result. No need to check again")
+							),+,
+							item.database_id.get().unwrap() // we know for sure it's there
+						];
+
+						let query =
+							"UPDATE cache SET ".to_string() +
+							$(
+								stringify!($field) + " = ?, " +
+								stringify!($field) + "_cached = ?, " +
+							)+
+							" id = id" + // no-op because of the trailing comma
+							" WHERE id = ?";
+						println!("cache.write -> {}", query);
+						self.database.execute(&query, params)?;
+					}}
+				}
+
+				update!([doi,arxiv,semanticscholar]);
+			}
+
+			Ok(())
+		}();
+
+		match result {
+			Ok(_) => { println!("That looks good, committing the transaction..."); self.database.execute("COMMIT TRANSACTION", rusqlite::NO_PARAMS)?; Ok(()) }
+			Err(e) => { println!("Ouch, got error {}, rolling back...", e); self.database.execute("ROLLBACK TRANSACTION", rusqlite::NO_PARAMS)?; Err(MyError::Sqlite(e)) }
+		}
+	}
+
 
 	pub fn solve_conflict(&self, reproducer: &PublicationData) {
+
+		/// applies a user-supplied conflict solution to the in-memory data structures.
+		/// returns an array of PublicationData that must be written to the database.
+		fn apply_conflict_solution(reproducer: &PublicationData, matches: &Vec<PublicationData>, actions: Vec<RepairAction>) -> Vec<PublicationData> {
+			let mut corrected = Vec::<PublicationData>::new();
+			corrected.push(reproducer.clone());
+			corrected.extend(matches.iter().cloned());
+
+			for action in actions {
+				let target = &mut corrected[action.number-1];
+
+				let target_identifier =
+					match action.identifier.as_str() {
+						"doi" => &mut target.doi,
+						"arxiv" => &mut target.arxiv,
+						"semanticscholar" => &mut target.semanticscholar,
+						_ => unreachable!("apply_conflict_solution() is only called with pre-checked actions, there can't be illegal actions")
+					};
+
+				target_identifier.take();
+				target_identifier.set(action.new_value).unwrap(); // cannot fail, we just took the item out
+			}
+
+			corrected
+		}
+
+
+
 		let matches = self.get_all(reproducer).unwrap();
 
 		println!("##########################");
@@ -473,7 +560,15 @@ impl PublicationCache {
 		print!("> ");
 		stdout().flush().ok();
 
+		struct RepairAction {
+			number: usize,
+			identifier: String,
+			new_value: Option<String>
+		};
+		let mut actions: Vec<RepairAction>;
+
 		'inputloop: loop {
+			actions = Vec::new();
 
 			fn prompt() {
 				println!("Please enter a correction.");
@@ -485,11 +580,14 @@ impl PublicationCache {
 			stdin().read_line(&mut input).expect("error: unable to read user input");
 			input = input.trim().into();
 
-			let mut ok = false;
+			let mut ok = false; // check if at least one command was parsed
 			
 			let commands = input.split(',');
 
 			for command in commands {
+				// parse and check an individual command
+
+				// split "lvalue=rvalue"
 				let mut parts: Vec<_> = command.split('=').collect();
 				
 				if parts.len() != 2 {
@@ -501,6 +599,7 @@ impl PublicationCache {
 				let lvalue = parts.remove(0).trim();
 				let rvalue = parts.remove(0).trim();
 
+				// split "doi1" into string + number
 				fn split_num(s: &str) -> (&str, &str) {
 					for (i, c) in s.chars().enumerate() {
 						if c.is_numeric() {
@@ -518,13 +617,15 @@ impl PublicationCache {
 				}
 
 				let number = number_str.parse::<usize>().unwrap(); // cannot fail
-
+				
+				// check the number
 				if number > matches.len()+1 {
 					println!("error: number must be between 1 and {} in {}", matches.len()+1, lvalue);
 					prompt();
 					continue 'inputloop;
 				}
 
+				// check the identifier
 				if identifier.len() == 0 {
 					if all_matching_keys.len() == 1 {
 						identifier = all_matching_keys.get(0).unwrap();
@@ -536,6 +637,20 @@ impl PublicationCache {
 					}
 				}
 
+				let identifier_valid = match identifier {
+					"doi" => true,
+					"arxiv" => true,
+					"semanticscholar" => true,
+					_ => false
+				};
+
+				if !identifier_valid {
+					println!("error: invalid identifier '{}'", identifier);
+					prompt();
+					continue 'inputloop;
+				}
+
+				// parse the new value
 				let new_value: Option<String> =
 					match rvalue {
 						"" => None,
@@ -544,17 +659,24 @@ impl PublicationCache {
 					};
 
 				println!("parsed: set #{}'s {} to {:?}", number, identifier, new_value);
+				actions.push( RepairAction{number, identifier: identifier.into(), new_value} );
 				ok = true;
-			}
+			} // for command in commands
 
 			if ok {
-				//break 'inputloop;
+				break 'inputloop;
 			}
 			else {
 				prompt();
 				continue 'inputloop;
 			}
-		}
+		} // 'inputloop
+
+		println!("Ok, we got a conflict solution supplied by the user. Let's apply it");
+		let new_items = apply_conflict_solution(reproducer, &matches, actions);
+		println!("For reference, new_items is {:#?}", new_items);
+		self.commit_conflict_solution(new_items).unwrap();
+		println!("Yay, successfully resolved the conflict :)");
 	}
 }
 
