@@ -978,7 +978,7 @@ impl<'a> Publication<'a> {
 					Ok(text) => {
 						println!("\tparsing html!");
 						let doc = soup::Soup::new(&text);
-						for link in doc.tag("a").attr("data-heap-unpaywall-link","true").find_all() {
+						for link in doc.tag("a").attr("data-heap-direct-pdf-link", "true").find_all() {
 							//println!("\t\tlink: {}", link.display());
 							match link.get("link") {
 								Some(result) => { println!("\t\t=> {}", result); return Ok(result) },
